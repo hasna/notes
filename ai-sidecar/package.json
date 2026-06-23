@@ -1,0 +1,16 @@
+{
+  "name": "hasna-notes-ai-sidecar",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local AI sidecar for Hasna Notes — auto-title + voice transcription via the Vercel AI SDK (OpenAI).",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "@ai-sdk/openai": "3.0.71",
+    "ai": "6.0.205",
+    "ws": "8.18.3"
+  }
+}

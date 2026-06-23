@@ -1,0 +1,7 @@
+.build/
+dist/
+*.icns
+.DS_Store
+node_modules/
+ai-sidecar/node_modules/
+tools/shots/
