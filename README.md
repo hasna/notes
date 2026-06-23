@@ -212,11 +212,17 @@ transcription uses OpenAI realtime
 transcription when `OPENAI_API_KEY` is available, with ElevenLabs Scribe v2
 Realtime as an optional fallback when `ELEVENLABS_API_KEY` is present. Bounded
 OpenAI transcription remains the fallback and defaults to `gpt-4o-transcribe`.
-For OpenAI realtime, the WebSocket session model is configured separately from
-the streaming transcription model: `HASNA_NOTES_OPENAI_REALTIME_SESSION_MODEL`
-defaults to `gpt-realtime`, while
-`HASNA_NOTES_OPENAI_REALTIME_TRANSCRIPTION_MODEL` defaults to
-`gpt-realtime-whisper`.
+For OpenAI realtime, the sidecar uses the transcription-session WebSocket
+endpoint (`/v1/realtime?intent=transcription`) and sends
+`HASNA_NOTES_OPENAI_REALTIME_TRANSCRIPTION_MODEL` (default
+`gpt-realtime-whisper`) as `audio.input.transcription.model`. No `model=` query
+parameter is sent on that WebSocket. Transcription-only models are rejected from
+the legacy realtime session-model slot; if an override puts
+`gpt-realtime-whisper`, `gpt-4o-transcribe`, `gpt-4o-mini-transcribe`, or
+`whisper-1` there, the sidecar falls back to `gpt-realtime` and reports a
+`configWarnings` entry from `/health`. `HASNA_NOTES_TRANSCRIBE_MODEL=
+gpt-realtime-whisper` is also ignored, because bounded transcription uses
+request/response speech-to-text models.
 
 ## Requirements
 

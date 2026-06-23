@@ -297,6 +297,57 @@ function openFakeTitleServer(title, seen = []) {
   });
 }
 
+async function freePort() {
+  const server = createServer();
+  await new Promise((resolve, reject) => {
+    server.on('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const port = server.address().port;
+  await new Promise(resolve => server.close(resolve));
+  return port;
+}
+
+async function startSidecar(t, env = {}) {
+  const port = await freePort();
+  const child = spawn(process.execPath, [join(repoRoot, 'ai-sidecar', 'server.mjs')], {
+    cwd: repoRoot,
+    env: {
+      PATH: process.env.PATH || '',
+      HOME: process.env.HOME || '',
+      PORT: String(port),
+      OPENAI_API_KEY: '',
+      ELEVENLABS_API_KEY: '',
+      ...env,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', c => { stdout += c; });
+  child.stderr.on('data', c => { stderr += c; });
+  t.after(() => {
+    if (!child.killed) child.kill('SIGTERM');
+  });
+
+  const health = async () => {
+    const res = await fetch(`http://127.0.0.1:${port}/health`);
+    assert.equal(res.status, 200);
+    return res.json();
+  };
+
+  for (let i = 0; i < 50; i += 1) {
+    if (child.exitCode !== null) break;
+    try {
+      await health();
+      return { port, child, health };
+    } catch {
+      await delay(100);
+    }
+  }
+  throw new Error(`sidecar did not start on ${port}\nstdout=${stdout}\nstderr=${stderr}`);
+}
+
 test('legacy tags parse as labels and serialize as labels', async (t) => {
   const root = await tempRoot(t);
   const notesDir = join(root, 'notes');
@@ -1093,9 +1144,11 @@ test('recording and realtime transcription contracts are exposed to UI/native ho
   assert.match(sidecar, /gpt-realtime-whisper/);
   assert.match(sidecar, /OPENAI_REALTIME_SESSION_MODEL/);
   assert.match(sidecar, /OPENAI_REALTIME_TRANSCRIPTION_MODEL/);
-  assert.match(sidecar, /realtime\?model=\$\{encodeURIComponent\(OPENAI_REALTIME_SESSION_MODEL\)\}/);
+  assert.match(sidecar, /OPENAI_REALTIME_TRANSCRIPTION_WS_URL = 'wss:\/\/api\.openai\.com\/v1\/realtime\?intent=transcription'/);
+  assert.match(sidecar, /mode: 'transcription_session'/);
   assert.match(sidecar, /transcription:\s*\{\s*model: OPENAI_REALTIME_TRANSCRIPTION_MODEL/s);
-  assert.doesNotMatch(sidecar, /realtime\?model=\$\{encodeURIComponent\(OPENAI_REALTIME_TRANSCRIPTION_MODEL\)\}/);
+  assert.doesNotMatch(sidecar, /realtime\?model=.*OPENAI_REALTIME_TRANSCRIPTION_MODEL/);
+  assert.doesNotMatch(sidecar, /realtime\?model=.*OPENAI_REALTIME_SESSION_MODEL/);
   assert.match(sidecar, /scribe_v2_realtime/);
   assert.match(app, /finalizeTimer/);
   assert.match(app, /startToken/);
@@ -1105,6 +1158,39 @@ test('recording and realtime transcription contracts are exposed to UI/native ho
   assert.match(app, /moveToMachine/);
   assert.match(app, /setTrashRetentionDays/);
   assert.match(app, /postNative\('settings'/);
+});
+
+test('sidecar keeps bounded and realtime transcription models in separate slots', async (t) => {
+  const guarded = await startSidecar(t, {
+    HASNA_NOTES_TRANSCRIBE_MODEL: 'gpt-realtime-whisper',
+    HASNA_NOTES_OPENAI_REALTIME_SESSION_MODEL: 'gpt-realtime-whisper',
+    HASNA_NOTES_OPENAI_REALTIME_TRANSCRIPTION_MODEL: 'gpt-realtime-whisper',
+  });
+  const health = await guarded.health();
+  assert.equal(health.transcribeModel, 'gpt-4o-transcribe');
+  assert.equal(health.realtimeModels.openaiSession, 'gpt-realtime');
+  assert.equal(health.realtimeModels.openaiTranscription, 'gpt-realtime-whisper');
+  assert.equal(health.realtimeEndpoints.openai, '/v1/realtime?intent=transcription');
+  assert.ok(health.configWarnings.some(w => w.includes('HASNA_NOTES_TRANSCRIBE_MODEL=gpt-realtime-whisper')));
+  assert.ok(health.configWarnings.some(w => w.includes('audio.input.transcription.model')));
+
+  for (const invalidSessionModel of ['gpt-4o-transcribe', 'gpt-4o-mini-transcribe', 'whisper-1']) {
+    const invalidSession = await startSidecar(t, {
+      HASNA_NOTES_OPENAI_REALTIME_SESSION_MODEL: invalidSessionModel,
+    });
+    const invalidHealth = await invalidSession.health();
+    assert.equal(invalidHealth.realtimeModels.openaiSession, 'gpt-realtime');
+    assert.ok(invalidHealth.configWarnings.some(w => w.includes(`Ignoring realtime session model ${invalidSessionModel}`)));
+    assert.ok(invalidHealth.configWarnings.some(w => w.includes('HASNA_NOTES_TRANSCRIBE_MODEL')));
+  }
+
+  const cheap = await startSidecar(t, {
+    HASNA_NOTES_TRANSCRIBE_MODEL: 'gpt-4o-mini-transcribe',
+    HASNA_NOTES_OPENAI_REALTIME_SESSION_MODEL: 'gpt-realtime',
+  });
+  const cheapHealth = await cheap.health();
+  assert.equal(cheapHealth.transcribeModel, 'gpt-4o-mini-transcribe');
+  assert.equal(cheapHealth.realtimeModels.openaiSession, 'gpt-realtime');
 });
 
 test('web machine selection and move-to-machine jump to destination context', async () => {

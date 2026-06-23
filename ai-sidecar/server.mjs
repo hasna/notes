@@ -35,17 +35,64 @@ const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || '';
 // surfaces as a clean 500 from the request handler rather than a crash on boot.
 const openai = createOpenAI({ apiKey: API_KEY });
 
+const DEFAULT_TRANSCRIBE_MODEL = 'gpt-4o-transcribe';
+const DEFAULT_OPENAI_REALTIME_SESSION_MODEL = 'gpt-realtime';
+const DEFAULT_OPENAI_REALTIME_TRANSCRIPTION_MODEL = 'gpt-realtime-whisper';
+const OPENAI_REALTIME_TRANSCRIPTION_WS_URL = 'wss://api.openai.com/v1/realtime?intent=transcription';
+const MODEL_CONFIG_WARNINGS = [];
+
+function envModel(value) {
+  return String(value || '').trim();
+}
+
+function isTranscriptionOnlyModel(model) {
+  const m = envModel(model).toLowerCase();
+  return m === 'gpt-realtime-whisper' ||
+    m.includes('transcribe') ||
+    m === 'whisper-1';
+}
+
+function normalizeBoundedTranscribeModel(model) {
+  const m = envModel(model);
+  if (!m) return DEFAULT_TRANSCRIBE_MODEL;
+  if (m === DEFAULT_OPENAI_REALTIME_TRANSCRIPTION_MODEL) {
+    MODEL_CONFIG_WARNINGS.push(
+      `Ignoring HASNA_NOTES_TRANSCRIBE_MODEL=${m}; bounded transcription uses ${DEFAULT_TRANSCRIBE_MODEL}.`
+    );
+    return DEFAULT_TRANSCRIBE_MODEL;
+  }
+  return m;
+}
+
+function normalizeRealtimeSessionModel(model) {
+  const m = envModel(model) || DEFAULT_OPENAI_REALTIME_SESSION_MODEL;
+  if (isTranscriptionOnlyModel(m)) {
+    const remediation = m === DEFAULT_OPENAI_REALTIME_TRANSCRIPTION_MODEL
+      ? `Use ${m} as HASNA_NOTES_OPENAI_REALTIME_TRANSCRIPTION_MODEL / audio.input.transcription.model instead.`
+      : `Use ${m} as HASNA_NOTES_TRANSCRIBE_MODEL only when explicitly choosing bounded transcription.`;
+    MODEL_CONFIG_WARNINGS.push(
+      `Ignoring realtime session model ${m}; transcription-only models are not valid realtime session models. ${remediation}`
+    );
+    return DEFAULT_OPENAI_REALTIME_SESSION_MODEL;
+  }
+  return m;
+}
+
+function normalizeRealtimeTranscriptionModel(model) {
+  return envModel(model) || DEFAULT_OPENAI_REALTIME_TRANSCRIPTION_MODEL;
+}
+
 const TITLE_MODEL = process.env.HASNA_NOTES_TITLE_MODEL || 'gpt-4o-mini';
 const CHAT_MODEL = process.env.HASNA_NOTES_CHAT_MODEL || process.env.HASNA_NOTES_TITLE_MODEL || 'gpt-4o-mini';
-const TRANSCRIBE_MODEL = process.env.HASNA_NOTES_TRANSCRIBE_MODEL || 'gpt-4o-transcribe';
-const OPENAI_REALTIME_SESSION_MODEL =
+const TRANSCRIBE_MODEL = normalizeBoundedTranscribeModel(process.env.HASNA_NOTES_TRANSCRIBE_MODEL);
+const OPENAI_REALTIME_SESSION_MODEL = normalizeRealtimeSessionModel(
   process.env.HASNA_NOTES_OPENAI_REALTIME_SESSION_MODEL ||
-  process.env.HASNA_NOTES_OPENAI_REALTIME_MODEL ||
-  'gpt-realtime';
-const OPENAI_REALTIME_TRANSCRIPTION_MODEL =
+  process.env.HASNA_NOTES_OPENAI_REALTIME_MODEL
+);
+const OPENAI_REALTIME_TRANSCRIPTION_MODEL = normalizeRealtimeTranscriptionModel(
   process.env.HASNA_NOTES_OPENAI_REALTIME_TRANSCRIPTION_MODEL ||
-  process.env.HASNA_NOTES_REALTIME_TRANSCRIPTION_MODEL ||
-  'gpt-realtime-whisper';
+  process.env.HASNA_NOTES_REALTIME_TRANSCRIPTION_MODEL
+);
 const ELEVENLABS_REALTIME_MODEL = process.env.HASNA_NOTES_ELEVENLABS_REALTIME_MODEL || 'scribe_v2_realtime';
 const DEFAULT_REALTIME_PROVIDER = (process.env.HASNA_NOTES_TRANSCRIPTION_PROVIDER || 'openai').toLowerCase();
 
@@ -326,8 +373,17 @@ async function handleChat(req, res) {
 }
 
 function bridgeOpenAIRealtime(client, sampleRate) {
+  if (isTranscriptionOnlyModel(OPENAI_REALTIME_SESSION_MODEL)) {
+    safeSend(client, {
+      type: 'error',
+      provider: 'openai',
+      error: 'invalid_realtime_session_model',
+    });
+    return;
+  }
+
   const openaiPartials = new Map();
-  const upstream = new WebSocket(`wss://api.openai.com/v1/realtime?model=${encodeURIComponent(OPENAI_REALTIME_SESSION_MODEL)}`, {
+  const upstream = new WebSocket(OPENAI_REALTIME_TRANSCRIPTION_WS_URL, {
     headers: { Authorization: `Bearer ${API_KEY}` },
   });
 
@@ -354,6 +410,7 @@ function bridgeOpenAIRealtime(client, sampleRate) {
       sampleRate: sampleRate || 24000,
       model: OPENAI_REALTIME_TRANSCRIPTION_MODEL,
       sessionModel: OPENAI_REALTIME_SESSION_MODEL,
+      mode: 'transcription_session',
     });
   });
 
@@ -465,6 +522,10 @@ const server = http.createServer((req, res) => {
         openaiTranscription: OPENAI_REALTIME_TRANSCRIPTION_MODEL,
         elevenlabs: ELEVENLABS_REALTIME_MODEL,
       },
+      realtimeEndpoints: {
+        openai: '/v1/realtime?intent=transcription',
+      },
+      configWarnings: MODEL_CONFIG_WARNINGS,
     });
   }
   if (req.method === 'POST' && url === '/title') {

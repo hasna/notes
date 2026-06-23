@@ -530,16 +530,22 @@ WS   /realtime-transcribe?provider=openai|elevenlabs&sampleRate=24000
 ```
 
 Bounded transcription uses `HASNA_NOTES_TRANSCRIBE_MODEL` (default
-`gpt-4o-transcribe`). OpenAI realtime uses a separate WebSocket session model
-and streaming transcription model: `HASNA_NOTES_OPENAI_REALTIME_SESSION_MODEL`
-defaults to `gpt-realtime`, while
-`HASNA_NOTES_OPENAI_REALTIME_TRANSCRIPTION_MODEL` defaults to
-`gpt-realtime-whisper` and is sent as `audio.input.transcription.model`.
+`gpt-4o-transcribe`). OpenAI realtime uses the transcription-session WebSocket
+endpoint (`/v1/realtime?intent=transcription`) and sends
+`HASNA_NOTES_OPENAI_REALTIME_TRANSCRIPTION_MODEL` (default
+`gpt-realtime-whisper`) as `audio.input.transcription.model`. No `model=` query
+parameter is sent on that WebSocket. Transcription-only model names are not
+allowed in the legacy realtime session-model slot. If an override puts
+`gpt-realtime-whisper`, `gpt-4o-transcribe`, `gpt-4o-mini-transcribe`, or
+`whisper-1` there, the sidecar falls back to `gpt-realtime` and exposes a
+`configWarnings` entry from `/health`. `HASNA_NOTES_TRANSCRIBE_MODEL=
+gpt-realtime-whisper` is also ignored because the bounded `/transcribe` endpoint
+uses request/response speech-to-text models.
 
 OpenAI realtime events and ElevenLabs Scribe v2 realtime events are normalized to:
 
 ```js
-{ type: "ready", provider, sampleRate, model, sessionModel }
+{ type: "ready", provider, sampleRate, model, sessionModel, mode }
 { type: "transcript.delta", text, delta }
 { type: "transcript.completed", text }
 { type: "error", error }
