@@ -685,9 +685,17 @@ final class WeakScriptProxy: NSObject, WKScriptMessageHandler {
 /// float above the content, keep working).
 final class WindowDragStrip: NSView {
     override var mouseDownCanMoveWindow: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
     override func hitTest(_ point: NSPoint) -> NSView? {
-        // Only intercept the strip itself; never steal events meant for the web view.
-        return bounds.contains(convert(point, from: superview)) ? self : nil
+        // AppKit supplies `point` in this view's coordinate space. Keep the
+        // overlay hit-testable only inside its strip, without stealing events
+        // from the web controls below it.
+        return bounds.contains(point) ? self : nil
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.performDrag(with: event)
     }
 }
 
@@ -806,6 +814,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         web.frame = container.bounds
         container.addSubview(web)
         let dragStrip = WindowDragStrip(frame: NSRect(x: 0, y: frame.height - 30, width: frame.width, height: 30))
+        dragStrip.identifier = NSUserInterfaceItemIdentifier("window-drag-strip")
         dragStrip.autoresizingMask = [.width, .minYMargin]
         container.addSubview(dragStrip)
         window.contentView = container
