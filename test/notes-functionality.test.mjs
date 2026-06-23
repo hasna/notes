@@ -1330,6 +1330,19 @@ test('native destructive bridge actions require confirmed payloads', async () =>
   assert.match(swift, /case "delete":\s+guard allowDestructive\(action\) else \{ return \}/);
 });
 
+test('native window drag strip uses local hit testing and performDrag', async () => {
+  const swift = await readFile(join(repoRoot, 'Sources', 'HasnaNotesApp', 'main.swift'), 'utf8');
+  const dragClass = swift.match(/final class WindowDragStrip: NSView \{[\s\S]*?\n\}/)?.[0] || '';
+  assert.match(dragClass, /override var mouseDownCanMoveWindow: Bool \{ true \}/);
+  assert.match(dragClass, /override func acceptsFirstMouse\(for event: NSEvent\?\) -> Bool \{ true \}/);
+  assert.match(dragClass, /return bounds\.contains\(point\) \? self : nil/);
+  assert.doesNotMatch(dragClass, /convert\(point,\s*from:/);
+  assert.match(dragClass, /window\?\.performDrag\(with: event\)/);
+  assert.match(swift, /WindowDragStrip\(frame: NSRect\(x: 0, y: frame\.height - 30, width: frame\.width, height: 30\)\)/);
+  assert.match(swift, /dragStrip\.identifier = NSUserInterfaceItemIdentifier\("window-drag-strip"\)/);
+  assert.match(swift, /dragStrip\.autoresizingMask = \[\.width, \.minYMargin\]/);
+});
+
 test('recording and realtime transcription contracts are exposed to UI/native host', async () => {
   const app = await readFile(join(repoRoot, 'web', 'app.js'), 'utf8');
   assert.match(app, /hasna:recording-state/);
