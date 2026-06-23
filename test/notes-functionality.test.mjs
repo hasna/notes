@@ -249,6 +249,7 @@ function loadWebAppWithFakeDOM(app) {
       for (const fn of listeners.get(event.type) || []) fn(event);
       return true;
     },
+    confirm() { return false; },
     prompt() { return ''; },
   };
   const document = createFakeDocument();
@@ -674,6 +675,112 @@ test('web chat bridge emits tool source and confirmation events', async () => {
   assert.equal(windowTarget.HasnaNotes.chat.state().toolCalls[0].state, 'result');
 });
 
+test('web note action bridge confirms trash and permanent purge', async () => {
+  const app = await readFile(join(repoRoot, 'web', 'app.js'), 'utf8');
+  const { windowTarget } = loadWebAppWithFakeDOM(app);
+  const prompts = [];
+  const events = [];
+  let confirmResult = false;
+  windowTarget.confirm = message => {
+    prompts.push(message);
+    return confirmResult;
+  };
+  windowTarget.addEventListener('hasna:note-trash', event => events.push({ name: 'trash', detail: event.detail }));
+  windowTarget.addEventListener('hasna:note-purge', event => events.push({ name: 'purge', detail: event.detail }));
+
+  windowTarget.HasnaNotes.hydrate({
+    thisMachine: 'apple03',
+    notes: [{
+      id: 'bridge-delete',
+      title: 'Bridge Delete',
+      body: 'Delete confirmation body',
+      labels: [],
+      status: 'active',
+      machine: 'apple03',
+      updatedAt: '2026-06-23T10:00:00Z',
+      createdAt: '2026-06-23T09:00:00Z',
+    }],
+    machines: [{ id: 'apple03' }],
+  });
+
+  const cancelledTrash = windowTarget.HasnaNotes.notes.trash('bridge-delete');
+  assert.equal(cancelledTrash, null);
+  assert.match(prompts.at(-1), /^Move note to Trash\?/);
+  assert.match(prompts.at(-1), /Bridge Delete/);
+  assert.ok(windowTarget.HasnaNotes.view.state().visibleNoteIds.includes('bridge-delete'));
+  assert.equal(events.length, 0);
+
+  confirmResult = true;
+  const trashed = windowTarget.HasnaNotes.notes.trash('bridge-delete');
+  assert.equal(trashed.status, 'trash');
+  assert.equal(events.at(-1).name, 'trash');
+  windowTarget.HasnaNotes.notes.setStatusFilter('trash');
+  assert.ok(windowTarget.HasnaNotes.view.state().visibleNoteIds.includes('bridge-delete'));
+
+  confirmResult = false;
+  const cancelledPurge = windowTarget.HasnaNotes.notes.purge('bridge-delete');
+  assert.equal(cancelledPurge, null);
+  assert.match(prompts.at(-1), /^Delete permanently\?/);
+  assert.match(prompts.at(-1), /cannot be undone/);
+  assert.ok(windowTarget.HasnaNotes.view.state().visibleNoteIds.includes('bridge-delete'));
+
+  confirmResult = true;
+  const purged = windowTarget.HasnaNotes.notes.purge('bridge-delete');
+  assert.equal(purged.id, 'bridge-delete');
+  assert.equal(purged.permanent, true);
+  assert.equal(events.at(-1).name, 'purge');
+  assert.equal(windowTarget.HasnaNotes.view.state().visibleNoteIds.includes('bridge-delete'), false);
+});
+
+test('web expired Trash cleanup is observable and confirmation-gated', async () => {
+  const app = await readFile(join(repoRoot, 'web', 'app.js'), 'utf8');
+  const { windowTarget } = loadWebAppWithFakeDOM(app);
+  const cleanupReady = [];
+  const purges = [];
+  const prompts = [];
+  let confirmResult = false;
+  windowTarget.confirm = message => {
+    prompts.push(message);
+    return confirmResult;
+  };
+  windowTarget.addEventListener('hasna:trash-cleanup-ready', event => cleanupReady.push(event.detail));
+  windowTarget.addEventListener('hasna:note-purge', event => purges.push(event.detail));
+
+  windowTarget.HasnaNotes.hydrate({
+    thisMachine: 'apple03',
+    notes: [{
+      id: 'expired-trash',
+      title: 'Expired Trash',
+      body: 'Expired body',
+      labels: [],
+      status: 'trash',
+      machine: 'apple03',
+      trashedAt: '2025-01-01T00:00:00.000Z',
+      trashExpiresAt: '2025-02-01T00:00:00.000Z',
+      updatedAt: '2025-01-01T00:00:00.000Z',
+      createdAt: '2025-01-01T00:00:00.000Z',
+    }],
+    machines: [{ id: 'apple03' }],
+  });
+
+  assert.equal(cleanupReady.length, 1);
+  assert.equal(cleanupReady[0].count, 1);
+  assert.deepEqual(Array.from(cleanupReady[0].noteIds), ['expired-trash']);
+  windowTarget.HasnaNotes.notes.setStatusFilter('trash');
+  assert.ok(windowTarget.HasnaNotes.view.state().visibleNoteIds.includes('expired-trash'));
+
+  assert.deepEqual(Array.from(windowTarget.HasnaNotes.notes.cleanupExpiredTrash()), []);
+  assert.match(prompts.at(-1), /^Delete expired Trash notes permanently\?/);
+  assert.match(prompts.at(-1), /cannot be undone/);
+  assert.ok(windowTarget.HasnaNotes.view.state().visibleNoteIds.includes('expired-trash'));
+  assert.equal(purges.length, 0);
+
+  confirmResult = true;
+  assert.deepEqual(Array.from(windowTarget.HasnaNotes.notes.cleanupExpiredTrash()), ['expired-trash']);
+  assert.equal(purges.at(-1).reason, 'retention-cleanup');
+  assert.equal(windowTarget.HasnaNotes.view.state().visibleNoteIds.includes('expired-trash'), false);
+});
+
 test('labels can be assigned, renamed, listed, and deleted', async (t) => {
   const root = await tempRoot(t);
   const id = uuidFor(99);
@@ -918,11 +1025,35 @@ test('CLI creates, lists, and assigns labels with JSON output', async (t) => {
   const consolidatedNote = (await loadNotes(root)).find(item => item.title === 'Consolidated Notes');
   assert.equal(consolidatedNote.createdByName, 'CLI Agent');
 
+  const trashPreview = await runNode(cliPath, ['trash', consolidatedNote.id, '--json'], env);
+  assert.equal(trashPreview.code, 0, trashPreview.stderr);
+  assert.equal(JSON.parse(trashPreview.stdout).requiresConfirmation, true);
+  assert.equal((await getNote(consolidatedNote.id, root)).status, 'active');
+
+  const trashedViaTrash = await runNode(cliPath, ['trash', consolidatedNote.id, '--force', '--json'], env);
+  assert.equal(trashedViaTrash.code, 0, trashedViaTrash.stderr);
+  assert.equal(JSON.parse(trashedViaTrash.stdout).status, 'trash');
+  const beforeRepeatTrash = await getNote(consolidatedNote.id, root);
+  const repeatedTrash = await runNode(cliPath, ['trash', consolidatedNote.id, '--json'], env);
+  assert.equal(repeatedTrash.code, 0, repeatedTrash.stderr);
+  assert.equal(JSON.parse(repeatedTrash.stdout).status, 'trash');
+  assert.equal((await getNote(consolidatedNote.id, root)).trashedAt, beforeRepeatTrash.trashedAt);
+
   const archived = await runNode(cliPath, ['archive', note.id, '--json'], env);
   assert.equal(archived.code, 0, archived.stderr);
   assert.equal(JSON.parse(archived.stdout).status, 'archived');
 
-  const deleted = await runNode(cliPath, ['delete', note.id, '--json'], env);
+  const nonInteractiveDelete = await runNode(cliPath, ['delete', note.id], env);
+  assert.equal(nonInteractiveDelete.code, 0, nonInteractiveDelete.stderr);
+  assert.match(nonInteractiveDelete.stdout, /Re-run with --yes or --force/);
+  assert.equal((await getNote(note.id, root)).status, 'archived');
+
+  const deletePreview = await runNode(cliPath, ['delete', note.id, '--json'], env);
+  assert.equal(deletePreview.code, 0, deletePreview.stderr);
+  assert.equal(JSON.parse(deletePreview.stdout).requiresConfirmation, true);
+  assert.equal((await getNote(note.id, root)).status, 'archived');
+
+  const deleted = await runNode(cliPath, ['delete', note.id, '--yes', '--json'], env);
   assert.equal(deleted.code, 0, deleted.stderr);
   assert.equal(JSON.parse(deleted.stdout).status, 'trash');
 
@@ -936,10 +1067,32 @@ test('CLI creates, lists, and assigns labels with JSON output', async (t) => {
   assert.equal(JSON.parse(purgePreview.stdout).requiresConfirmation, true);
   assert.ok(await getNote(note.id, root));
 
-  const purged = await runNode(cliPath, ['purge', note.id, '--yes', '--json'], env);
+  const purged = await runNode(cliPath, ['purge', note.id, '--force', '--json'], env);
   assert.equal(purged.code, 0, purged.stderr);
   assert.equal(JSON.parse(purged.stdout).permanent, true);
   assert.equal(await getNote(note.id, root), null);
+
+  const expiredId = uuidFor(260);
+  await saveNote({
+    id: expiredId,
+    title: 'Expired CLI Trash',
+    body: 'expired',
+    status: 'trash',
+    machine: 'apple03',
+    trashedAt: '2025-01-01T00:00:00.000Z',
+    trashExpiresAt: '2025-02-01T00:00:00.000Z',
+  }, root);
+  const cleanupPreview = await runNode(cliPath, ['cleanup-trash', '--json'], env);
+  assert.equal(cleanupPreview.code, 0, cleanupPreview.stderr);
+  const cleanupPreviewBody = JSON.parse(cleanupPreview.stdout);
+  assert.equal(cleanupPreviewBody.requiresConfirmation, true);
+  assert.equal(cleanupPreviewBody.preview.count, 1);
+  assert.ok(await getNote(expiredId, root));
+
+  const cleanupConfirmed = await runNode(cliPath, ['cleanup-trash', '--yes', '--json'], env);
+  assert.equal(cleanupConfirmed.code, 0, cleanupConfirmed.stderr);
+  assert.equal(JSON.parse(cleanupConfirmed.stdout).count, 1);
+  assert.equal(await getNote(expiredId, root), null);
 });
 
 class McpClient {
@@ -1087,32 +1240,94 @@ test('MCP server exposes notes and labels tools over stdio framing', async (t) =
   assert.equal(missingPlain.result.isError, true);
   assert.equal(parseToolText(missingPlain).error, 'note_not_found');
 
-  const trashed = await client.send(16, 'tools/call', {
+  const trashCreated = await client.send(16, 'tools/call', {
+    name: 'notes_create',
+    arguments: { title: 'MCP Trash Target', body: 'trash body', targetMachine: 'apple03' },
+  });
+  const trashTarget = parseToolText(trashCreated);
+
+  const trashPreview = await client.send(17, 'tools/call', {
+    name: 'notes_trash',
+    arguments: { id: trashTarget.id },
+  });
+  assert.equal(parseToolText(trashPreview).requiresConfirmation, true);
+  assert.equal((await getNote(trashTarget.id, root)).status, 'active');
+
+  const trashConfirmed = await client.send(18, 'tools/call', {
+    name: 'notes_trash',
+    arguments: { id: trashTarget.id, confirm: true },
+  });
+  assert.equal(parseToolText(trashConfirmed).status, 'trash');
+
+  const deletePreview = await client.send(19, 'tools/call', {
     name: 'notes_delete',
     arguments: { id: note.id },
   });
+  assert.equal(parseToolText(deletePreview).requiresConfirmation, true);
+  assert.equal((await getNote(note.id, root)).status, 'active');
+
+  const trashed = await client.send(20, 'tools/call', {
+    name: 'notes_delete',
+    arguments: { id: note.id, confirm: true },
+  });
   assert.equal(parseToolText(trashed).status, 'trash');
 
-  const deleteAgainPreview = await client.send(17, 'tools/call', {
+  const deleteAgainPreview = await client.send(21, 'tools/call', {
     name: 'notes_delete',
     arguments: { id: note.id },
   });
   assert.equal(parseToolText(deleteAgainPreview).requiresConfirmation, true);
   assert.ok(await getNote(note.id, root));
 
-  const purgePreview = await client.send(18, 'tools/call', {
+  const purgePreview = await client.send(22, 'tools/call', {
     name: 'notes_purge',
     arguments: { id: note.id },
   });
   assert.equal(parseToolText(purgePreview).requiresConfirmation, true);
   assert.ok(await getNote(note.id, root));
 
-  const purged = await client.send(19, 'tools/call', {
+  const purged = await client.send(23, 'tools/call', {
     name: 'notes_purge',
     arguments: { id: note.id, confirm: true },
   });
   assert.equal(parseToolText(purged).permanent, true);
   assert.equal(await getNote(note.id, root), null);
+
+  const expiredId = uuidFor(261);
+  await saveNote({
+    id: expiredId,
+    title: 'Expired MCP Trash',
+    body: 'expired',
+    status: 'trash',
+    machine: 'apple03',
+    trashedAt: '2025-01-01T00:00:00.000Z',
+    trashExpiresAt: '2025-02-01T00:00:00.000Z',
+  }, root);
+  const cleanupPreview = await client.send(24, 'tools/call', {
+    name: 'trash_cleanup',
+    arguments: {},
+  });
+  assert.equal(parseToolText(cleanupPreview).requiresConfirmation, true);
+  assert.equal(parseToolText(cleanupPreview).preview.count, 1);
+  assert.ok(await getNote(expiredId, root));
+
+  const cleanupConfirmed = await client.send(25, 'tools/call', {
+    name: 'trash_cleanup',
+    arguments: { confirm: true },
+  });
+  assert.equal(parseToolText(cleanupConfirmed).count, 1);
+  assert.equal(await getNote(expiredId, root), null);
+});
+
+test('native destructive bridge actions require confirmed payloads', async () => {
+  const app = await readFile(join(repoRoot, 'web', 'app.js'), 'utf8');
+  const swift = await readFile(join(repoRoot, 'Sources', 'HasnaNotesApp', 'main.swift'), 'utf8');
+  assert.match(app, /postNative\('trash', serializeNote\(note\), \{ confirmed:/);
+  assert.match(app, /postNative\('purge', serializeNote\(note\), \{ confirmed:/);
+  assert.match(swift, /destructiveConfirmed/);
+  assert.match(swift, /case "trash":\s+guard allowDestructive\(action\) else \{ return \}/);
+  assert.match(swift, /case "purge":\s+guard allowDestructive\(action\) else \{ return \}/);
+  assert.match(swift, /case "delete":\s+guard allowDestructive\(action\) else \{ return \}/);
 });
 
 test('recording and realtime transcription contracts are exposed to UI/native host', async () => {

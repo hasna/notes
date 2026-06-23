@@ -914,6 +914,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             return
         }
         let noteDict = (payload["note"] as? [String: Any]) ?? [:]
+        let destructiveConfirmed = (payload["confirmed"] as? Bool) == true || (noteDict["confirmed"] as? Bool) == true
+        func allowDestructive(_ action: String) -> Bool {
+            if destructiveConfirmed { return true }
+            NSLog("HasnaNotes: ignored unconfirmed destructive notes action '\(action)'")
+            return false
+        }
 
         var changed = false
         switch action {
@@ -921,11 +927,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         case "save":   changed = bridge.save(noteDict, isCreate: false)
         case "move":   changed = bridge.move(noteDict)
         case "archive": changed = bridge.archive(noteDict)
-        case "trash":  changed = bridge.trash(noteDict)
+        case "trash":
+            guard allowDestructive(action) else { return }
+            changed = bridge.trash(noteDict)
         case "restore": changed = bridge.restore(noteDict)
-        case "purge":  changed = bridge.purge(noteDict)
+        case "purge":
+            guard allowDestructive(action) else { return }
+            changed = bridge.purge(noteDict)
         case "settings": changed = bridge.updateSettings(noteDict)
-        case "delete": changed = bridge.delete(noteDict)
+        case "delete":
+            guard allowDestructive(action) else { return }
+            changed = bridge.delete(noteDict)
         default:
             NSLog("HasnaNotes: unknown notes action '\(action)'")
         }

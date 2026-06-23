@@ -117,14 +117,18 @@ note.titleLocked = true;
 note.titleSource = "manual";
 ```
 
-Archive, Trash, restore, move, and purge are explicit bridge actions:
+Archive, restore, and move are explicit bridge actions. Destructive Trash,
+Delete, and purge UI should call `window.HasnaNotes.notes.trash(noteId)` /
+`window.HasnaNotes.notes.purge(noteId)` so the app confirmation is shown first;
+raw WebKit destructive posts are internal persistence traffic and are ignored by
+the native host unless the app layer already confirmed the action.
 
 ```js
 window.webkit.messageHandlers.notes.postMessage({ action: "archive", note })
-window.webkit.messageHandlers.notes.postMessage({ action: "trash", note })
 window.webkit.messageHandlers.notes.postMessage({ action: "restore", note })
 window.webkit.messageHandlers.notes.postMessage({ action: "move", note })
-window.webkit.messageHandlers.notes.postMessage({ action: "purge", note })
+window.HasnaNotes.notes.trash(noteId)
+window.HasnaNotes.notes.purge(noteId)
 ```
 
 Normal Delete should call the Trash path unless `note.status === "trash"`, in
@@ -313,9 +317,10 @@ hasna-notes agent "consolidate renewal notes" --yes --json
 ```
 
 MCP tools: `agent_tools`, `agent_run`, and `agent_tool_call`.
-Direct MCP permanent-deletion surfaces are also confirmation-gated:
-`notes_delete` returns a preview when it would permanently delete a trashed note
-or when `permanent: true`, and `notes_purge` previews unless `confirm: true`.
+Direct CLI/MCP deletion surfaces are confirmation-gated. `delete`, `trash`,
+`cleanup-trash`, `notes_delete`, `notes_trash`, and `trash_cleanup` return a
+preview unless confirmed; permanent `purge` / `notes_purge` require `--yes` /
+`--force` or `confirm: true`.
 
 ## Note Actions API
 
@@ -334,6 +339,12 @@ window.HasnaNotes.notes.settings()
 window.HasnaNotes.notes.setTrashRetentionDays(days)
 ```
 
+`notes.trash(noteId)` and `notes.purge(noteId)` show the app confirmation before
+mutating state. Normal delete copy should read "Move note to Trash?", while
+permanent purge copy should read "Delete permanently?" and mention that the
+action cannot be undone. `notes.cleanupExpiredTrash()` also requires a strong
+confirmation before it permanently purges expired Trash items.
+
 The web layer dispatches:
 
 ```js
@@ -342,6 +353,7 @@ hasna:note-archive
 hasna:note-trash
 hasna:note-restore
 hasna:note-purge
+hasna:trash-cleanup-ready
 ```
 
 All note action event details include `{ noteId, note }`; move events also include

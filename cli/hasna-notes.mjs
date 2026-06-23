@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { readFile } from 'node:fs/promises';
+import { createInterface } from 'node:readline/promises';
 import {
   MARKDOWN_COMMANDS,
   applyMarkdownCommand,
@@ -44,12 +45,12 @@ Usage:
   hasna-notes list [--json] [--limit 10] [--offset 0] [--label name] [--machine id] [--query text]
   hasna-notes get <id> [--json]
   hasna-notes create [--title text] [--body text | --body-file path] [--label name ...] [--actor-type agent] [--actor-name name] [--target-machine id] [--opened-from text] [--json]
-  hasna-notes delete <id> [--permanent] [--yes]
+  hasna-notes delete <id> [--permanent] [--yes|--force]
   hasna-notes archive <id>
-  hasna-notes trash <id> [--retention-days 30]
+  hasna-notes trash <id> [--retention-days 30] [--yes|--force]
   hasna-notes restore <id>
-  hasna-notes purge <id> [--yes]
-  hasna-notes cleanup-trash
+  hasna-notes purge <id> [--yes|--force]
+  hasna-notes cleanup-trash [--yes|--force]
   hasna-notes move <id> <machine>
   hasna-notes machines list [--json]
   hasna-notes machines details <machine> [--json]
@@ -120,8 +121,71 @@ function permanentDeletePreview(note, command) {
       status: note.status || 'active',
       permanent: true,
     },
-    hint: 'Re-run with --yes to permanently delete.',
+    hint: 'Re-run with --yes or --force to permanently delete.',
   };
+}
+
+function moveToTrashPreview(note, command) {
+  return {
+    ok: false,
+    dryRun: true,
+    requiresConfirmation: true,
+    command,
+    preview: {
+      id: note.id,
+      title: note.title || 'Untitled Note',
+      status: note.status || 'active',
+      permanent: false,
+      toStatus: 'trash',
+    },
+    hint: 'Re-run with --yes or --force to move this note to Trash.',
+  };
+}
+
+function cleanupTrashPreview(notes, command) {
+  return {
+    ok: false,
+    dryRun: true,
+    requiresConfirmation: true,
+    command,
+    preview: {
+      permanent: true,
+      count: notes.length,
+      ids: notes.map(note => note.id),
+      titles: notes.map(note => note.title || 'Untitled Note'),
+    },
+    hint: 'Re-run with --yes or --force to purge expired Trash notes.',
+  };
+}
+
+function hasConfirmationFlag(opts) {
+  return !!(opts.yes || opts.force);
+}
+
+function shouldAvoidPrompt(opts) {
+  return !!opts.json || !!process.env.CI || !process.stdin.isTTY || !process.stdout.isTTY;
+}
+
+async function promptYesNo(message) {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = await rl.question(`${message} [y/N] `);
+    return /^(y|yes)$/i.test(String(answer || '').trim());
+  } finally {
+    rl.close();
+  }
+}
+
+async function requireDestructiveConfirmation(preview, opts, message) {
+  if (hasConfirmationFlag(opts)) return true;
+  if (shouldAvoidPrompt(opts)) {
+    if (opts.json) jsonOut(preview);
+    else lineOut(`${message} Re-run with --yes or --force to confirm.`);
+    return false;
+  }
+  const ok = await promptYesNo(message);
+  if (!ok) lineOut('Cancelled');
+  return ok;
 }
 
 function machineSummary(machine) {
@@ -194,18 +258,19 @@ async function commandCreate(opts) {
 async function commandDelete(id, opts) {
   const note = await getNote(requireArg(id, 'id'));
   if (!note) throw new Error('note_not_found');
-  if (opts.permanent || note.status === 'trash') {
-    if (!opts.yes) {
-      const preview = permanentDeletePreview(note, 'delete');
-      if (opts.json) return jsonOut(preview);
-      lineOut(`Permanent delete requires confirmation for "${preview.preview.title}". Re-run with --yes to delete permanently.`);
-      return;
-    }
+  const permanent = opts.permanent || note.status === 'trash';
+  if (permanent) {
+    const preview = permanentDeletePreview(note, 'delete');
+    const message = `Delete permanently? "${preview.preview.title}" will be deleted and cannot be undone.`;
+    if (!(await requireDestructiveConfirmation(preview, opts, message))) return;
     await deleteNote(note.id);
     if (opts.json) return jsonOut({ ok: true, permanent: true });
     lineOut('Permanently deleted');
     return;
   }
+  const preview = moveToTrashPreview(note, 'delete');
+  const message = `Move note to Trash? "${preview.preview.title}" can be restored from Trash.`;
+  if (!(await requireDestructiveConfirmation(preview, opts, message))) return;
   const trashed = await trashNote(note.id, { retentionDays: opts['retention-days'] });
   if (opts.json) return jsonOut(trashed);
   lineOut('Moved to Trash');
@@ -218,9 +283,19 @@ async function commandArchive(id, opts) {
 }
 
 async function commandTrash(id, opts) {
-  const note = await trashNote(requireArg(id, 'id'), { retentionDays: opts['retention-days'], trashMachine: opts.machine });
-  if (opts.json) return jsonOut(note);
-  lineOut(noteSummary(note));
+  const note = await getNote(requireArg(id, 'id'));
+  if (!note) throw new Error('note_not_found');
+  if (note.status === 'trash') {
+    if (opts.json) return jsonOut(note);
+    lineOut(noteSummary(note));
+    return;
+  }
+  const preview = moveToTrashPreview(note, 'trash');
+  const message = `Move note to Trash? "${preview.preview.title}" can be restored from Trash.`;
+  if (!(await requireDestructiveConfirmation(preview, opts, message))) return;
+  const trashed = await trashNote(note.id, { retentionDays: opts['retention-days'], trashMachine: opts.machine });
+  if (opts.json) return jsonOut(trashed);
+  lineOut(noteSummary(trashed));
 }
 
 async function commandRestore(id, opts) {
@@ -232,18 +307,26 @@ async function commandRestore(id, opts) {
 async function commandPurge(id, opts) {
   const note = await getNote(requireArg(id, 'id'));
   if (!note) throw new Error('note_not_found');
-  if (!opts.yes) {
-    const preview = permanentDeletePreview(note, 'purge');
-    if (opts.json) return jsonOut(preview);
-    lineOut(`Purge requires confirmation for "${preview.preview.title}". Re-run with --yes to delete permanently.`);
-    return;
-  }
+  const preview = permanentDeletePreview(note, 'purge');
+  const message = `Delete permanently? "${preview.preview.title}" will be deleted and cannot be undone.`;
+  if (!(await requireDestructiveConfirmation(preview, opts, message))) return;
   await deleteNote(note.id);
   if (opts.json) return jsonOut({ ok: true, permanent: true });
   lineOut('Purged');
 }
 
 async function commandCleanupTrash(opts) {
+  const now = Date.now();
+  const expired = (await loadNotes()).filter(note => (
+    note.status === 'trash' &&
+    note.trashExpiresAt &&
+    Date.parse(note.trashExpiresAt) <= now
+  ));
+  if (expired.length) {
+    const preview = cleanupTrashPreview(expired, 'cleanup-trash');
+    const message = `Purge ${expired.length} expired Trash note(s)? This cannot be undone.`;
+    if (!(await requireDestructiveConfirmation(preview, opts, message))) return;
+  }
   const result = await purgeExpiredTrash();
   if (opts.json) return jsonOut(result);
   lineOut(`Purged ${result.count} expired note(s)`);

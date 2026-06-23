@@ -701,9 +701,9 @@
 
 	  // ------------------------------------------------------------------ persistence bridge
   // Send a write to the native host (or, in-browser, just keep the in-memory model).
-  function postNative(action, note) {
+  function postNative(action, note, extra) {
     if (native()) {
-      try { window.webkit.messageHandlers.notes.postMessage({ action: action, note: note }); }
+      try { window.webkit.messageHandlers.notes.postMessage(Object.assign({ action: action, note: note }, extra || {})); }
       catch (e) { /* host gone — ignore */ }
     }
   }
@@ -1525,21 +1525,23 @@
     render();
   }
 
-  function trashNote(note) {
+  function trashNote(note, options) {
+    if (note.status === 'trash') return note;
     const now = new Date().toISOString();
     note.status = 'trash';
     note.trashedAt = now;
     note.trashMachine = note.machine || state.thisMachine;
     note.trashExpiresAt = addDaysISO(now, state.settings.trashRetentionDays);
     note.updatedAt = now;
-    postNative('trash', serializeNote(note));
+    postNative('trash', serializeNote(note), { confirmed: !!(options && options.confirmed) });
     dispatchNoteEvent('hasna:note-trash', note);
+    return note;
   }
 
-  function purgeNote(id) {
+  function purgeNote(id, options) {
     const note = noteById(id);
     if (!note) return;
-    postNative('purge', serializeNote(note));
+    postNative('purge', serializeNote(note), { confirmed: !!(options && options.confirmed) });
     state.notes = state.notes.filter(n => n.id !== id);
     if (state.selectedId === id) {
       const v = visibleNotes();
@@ -1609,14 +1611,42 @@
   }
 
   function cleanupExpiredTrash() {
-    const now = Date.now();
-    const expired = state.notes.filter(n => n.status === 'trash' && n.trashExpiresAt && Date.parse(n.trashExpiresAt) <= now);
-    expired.forEach(n => postNative('purge', serializeNote(n)));
+    const expired = expiredTrashNotes();
+    if (!expired.length) return [];
+    if (!confirmExpiredTrashCleanup(expired)) return [];
+    expired.forEach(n => {
+      postNative('purge', serializeNote(n), { confirmed: true });
+      dispatchNoteEvent('hasna:note-purge', n, { reason: 'retention-cleanup' });
+    });
     if (expired.length) {
       const ids = new Set(expired.map(n => n.id));
       state.notes = state.notes.filter(n => !ids.has(n.id));
       render();
     }
+    return expired.map(n => n.id);
+  }
+
+  function expiredTrashNotes() {
+    const now = Date.now();
+    return state.notes.filter(n => n.status === 'trash' && n.trashExpiresAt && Date.parse(n.trashExpiresAt) <= now);
+  }
+
+  function confirmExpiredTrashCleanup(expired) {
+    if (typeof window.confirm !== 'function') return false;
+    return window.confirm('Delete expired Trash notes permanently?\n\n' +
+      expired.length + ' note(s) will be permanently deleted. This cannot be undone.');
+  }
+
+  function notifyExpiredTrashReady() {
+    const expired = expiredTrashNotes();
+    if (!expired.length) return [];
+    window.dispatchEvent(new CustomEvent('hasna:trash-cleanup-ready', {
+      detail: {
+        count: expired.length,
+        noteIds: expired.map(n => n.id),
+        notes: expired.map(serializeNote),
+      },
+    }));
     return expired.map(n => n.id);
   }
 
@@ -1626,16 +1656,51 @@
     render();
   }
 
+  function noteTitleForConfirm(note) {
+    return (note && note.title && note.title.trim()) || 'Untitled Note';
+  }
+
+  function deleteConfirmationMessage(note, options) {
+    const permanent = !!(options && options.permanent) || (note && note.status === 'trash');
+    const title = noteTitleForConfirm(note);
+    if (permanent) {
+      return 'Delete permanently?\n\n"' + title + '" will be permanently deleted. This cannot be undone.';
+    }
+    return 'Move note to Trash?\n\n"' + title + '" can be restored from Trash.';
+  }
+
+  function confirmNoteDelete(note, options) {
+    if (typeof window.confirm !== 'function') return false;
+    return window.confirm(deleteConfirmationMessage(note, options));
+  }
+
   // Delete a specific note (by reference). Normal delete moves to Trash first; a note
   // already in Trash is permanently purged.
   function deleteNote(note) {
     const permanent = note.status === 'trash';
-    const ok = window.confirm((permanent ? 'Permanently delete ' : 'Move to Trash ') +
-      '“' + ((note.title && note.title.trim()) || 'Untitled Note') + '”?');
-    if (!ok) return;
-    if (permanent) { purgeNote(note.id); return; }
-    trashNote(note);
+    if (!confirmNoteDelete(note, { permanent })) return null;
+    if (permanent) { purgeNote(note.id, { confirmed: true }); return; }
+    trashNote(note, { confirmed: true });
     render();
+    return serializeNote(note);
+  }
+
+  function trashNoteWithConfirmation(id) {
+    const note = noteById(id);
+    if (!note) return null;
+    if (note.status === 'trash') return serializeNote(note);
+    if (!confirmNoteDelete(note)) return null;
+    trashNote(note, { confirmed: true });
+    render();
+    return serializeNote(note);
+  }
+
+  function purgeNoteWithConfirmation(id) {
+    const note = noteById(id);
+    if (!note) return null;
+    if (!confirmNoteDelete(note, { permanent: true })) return null;
+    purgeNote(id, { confirmed: true });
+    return { id, permanent: true };
   }
 
 	  // ------------------------------------------------------------------ app-level voice notes
@@ -2358,7 +2423,7 @@
       const v = visibleNotes();
       state.selectedId = v.length ? v[0].id : null;
     }
-    cleanupExpiredTrash();
+    notifyExpiredTrashReady();
   }
 
   function normalizeMachine(m) {
@@ -2762,7 +2827,7 @@
         const call = addChatToolCall('trash_note', { id: note.id, dryRun: !opts.confirm });
         sources = [chatNoteRef(note)];
         if (opts.confirm) {
-          trashNote(note);
+          trashNote(note, { confirmed: true });
           render();
           answer = 'Moved "' + ((note.title && note.title.trim()) || 'Untitled Note') + '" to Trash.';
           finishChatToolCall(call, { note: chatNoteRef(note), sources }, 'result');
@@ -2846,7 +2911,7 @@
     } else if (note && approval.toolName === 'archive_note') {
       archiveNote(note.id);
     } else if (note && approval.toolName === 'trash_note') {
-      trashNote(note);
+      trashNote(note, { confirmed: true });
       render();
     } else if (note && approval.toolName === 'restore_note') {
       restoreNote(note.id);
@@ -2939,9 +3004,9 @@
 	    notes: {
 	      moveToMachine: moveNoteToMachine,
 	      archive: archiveNote,
-	      trash: function (id) { const n = noteById(id); if (n) { trashNote(n); render(); } },
-	      restore: restoreNote,
-      purge: purgeNote,
+		      trash: trashNoteWithConfirmation,
+		      restore: restoreNote,
+	      purge: purgeNoteWithConfirmation,
       info: noteInfo,
       setStatusFilter: setStatusFilter,
       cleanupExpiredTrash: cleanupExpiredTrash,

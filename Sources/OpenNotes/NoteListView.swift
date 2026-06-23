@@ -28,7 +28,7 @@ struct NoteListView: View {
                                     Button("Open") { store.selection = note.id }
                                     Button("Duplicate") { store.duplicate(id: note.id) }
                                     Divider()
-                                    Button("Delete", role: .destructive) { confirmDelete = note }
+                                    Button(note.status == .trash ? "Delete Permanently" : "Move to Trash", role: .destructive) { confirmDelete = note }
                                 }
                             Divider().opacity(0.35).padding(.leading, 16)
                         }
@@ -48,14 +48,18 @@ struct NoteListView: View {
             Button("New Note") { store.createNote() }
         }
         .confirmationDialog(
-            "Delete this note?",
+            confirmDelete?.status == .trash ? "Delete permanently?" : "Move note to Trash?",
             isPresented: Binding(get: { confirmDelete != nil }, set: { if !$0 { confirmDelete = nil } }),
             presenting: confirmDelete
         ) { note in
-            Button("Delete", role: .destructive) { store.delete(id: note.id); confirmDelete = nil }
+            Button(note.status == .trash ? "Delete Permanently" : "Move to Trash", role: .destructive) { store.delete(id: note.id); confirmDelete = nil }
             Button("Cancel", role: .cancel) { confirmDelete = nil }
         } message: { note in
-            Text("\"\(note.title)\" will be permanently removed.")
+            if note.status == .trash {
+                Text("\"\(note.title)\" will be permanently deleted. This cannot be undone.")
+            } else {
+                Text("\"\(note.title)\" can be restored from Trash.")
+            }
         }
     }
 

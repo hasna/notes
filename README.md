@@ -190,9 +190,10 @@ consolidation into a larger note. Destructive or broad writes return a preview
 unless confirmed (`--yes` in CLI or `confirm: true` in MCP). Agent-created notes
 write provenance metadata (`createdByActorType: agent`, friendly actor name,
 opened-from/source context).
-Direct MCP permanent-deletion paths are also gated: `notes_delete` previews
-when it would permanently delete, and `notes_purge` previews unless
-`confirm: true`.
+Direct CLI/MCP deletion paths are also gated: `delete`, `trash`,
+`cleanup-trash`, `notes_delete`, `notes_trash`, and `trash_cleanup` preview
+unless confirmed, while permanent `purge` / `notes_purge` require `--yes` /
+`--force` or `confirm: true`.
 
 The web bridge exposes `window.HasnaNotes.chat.state/tools/send/approve/clear`
 and dispatches `hasna:chat-*` events for state, messages, deltas, tool calls,

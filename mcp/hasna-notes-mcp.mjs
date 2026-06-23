@@ -13,6 +13,7 @@ import {
   listMachineDetails,
   listNotes,
   loadLabelList,
+  loadNotes,
   loadSettings,
   markdownPlainText,
   moveNoteToMachine,
@@ -110,7 +111,13 @@ const tools = [
     description: 'Move a note to per-machine Trash.',
     inputSchema: {
       type: 'object',
-      properties: { id: { type: 'string' }, retentionDays: { type: 'number' }, trashMachine: { type: 'string' } },
+      properties: {
+        id: { type: 'string' },
+        retentionDays: { type: 'number' },
+        trashMachine: { type: 'string' },
+        confirm: { type: 'boolean' },
+        dryRun: { type: 'boolean' },
+      },
       required: ['id'],
     },
   },
@@ -131,7 +138,7 @@ const tools = [
   {
     name: 'trash_cleanup',
     description: 'Purge expired Trash items according to retention metadata.',
-    inputSchema: { type: 'object', properties: {} },
+    inputSchema: { type: 'object', properties: { confirm: { type: 'boolean' }, dryRun: { type: 'boolean' } } },
   },
   {
     name: 'settings_get',
@@ -354,6 +361,15 @@ function destructivePreview(toolName, args, preview) {
   };
 }
 
+async function expiredTrashNotes() {
+  const now = Date.now();
+  return (await loadNotes()).filter(note => (
+    note.status === 'trash' &&
+    note.trashExpiresAt &&
+    Date.parse(note.trashExpiresAt) <= now
+  ));
+}
+
 async function markdownFromArgs(args) {
   if (args.markdown != null) return String(args.markdown);
   const note = await getNote(requireArg(args, 'id'));
@@ -425,8 +441,8 @@ async function callTool(name, args) {
       if (args.dryRun || !args.confirm) return textResult(destructivePreview('notes_delete', args, preview));
       await deleteNote(note.id);
     } else {
-      const preview = { id: note.id, title: note.title, fromStatus: note.status, toStatus: 'trash' };
-      if (args.dryRun) return textResult({ ok: false, dryRun: true, toolName: 'notes_delete', input: args, preview });
+      const preview = { id: note.id, title: note.title, fromStatus: note.status, toStatus: 'trash', permanent: false };
+      if (args.dryRun || !args.confirm) return textResult(destructivePreview('notes_delete', args, preview));
       return textResult(await trashNote(note.id, { retentionDays: args.retentionDays, trashMachine: args.trashMachine }));
     }
     return textResult({ ok: true });
@@ -438,7 +454,12 @@ async function callTool(name, args) {
   }
   if (name === 'notes_archive') return textResult(await archiveNote(requireArg(args, 'id')));
   if (name === 'notes_trash') {
-    return textResult(await trashNote(requireArg(args, 'id'), {
+    const note = await getNote(requireArg(args, 'id'));
+    if (!note) throw new Error('note_not_found');
+    if (note.status === 'trash') return textResult(note);
+    const preview = { id: note.id, title: note.title, fromStatus: note.status, toStatus: 'trash', permanent: false };
+    if (args.dryRun || !args.confirm) return textResult(destructivePreview('notes_trash', args, preview));
+    return textResult(await trashNote(note.id, {
       retentionDays: args.retentionDays,
       trashMachine: args.trashMachine,
     }));
@@ -452,7 +473,18 @@ async function callTool(name, args) {
     await deleteNote(note.id);
     return textResult({ ok: true, permanent: true });
   }
-  if (name === 'trash_cleanup') return textResult(await purgeExpiredTrash());
+  if (name === 'trash_cleanup') {
+    const expired = await expiredTrashNotes();
+    if (expired.length && (args.dryRun || !args.confirm)) {
+      return textResult(destructivePreview('trash_cleanup', args, {
+        permanent: true,
+        count: expired.length,
+        ids: expired.map(note => note.id),
+        titles: expired.map(note => note.title || 'Untitled Note'),
+      }));
+    }
+    return textResult(await purgeExpiredTrash());
+  }
   if (name === 'settings_get') return textResult(await loadSettings());
   if (name === 'settings_set_trash_retention') return textResult(await saveSettings({ trashRetentionDays: requireArg(args, 'days') }));
   if (name === 'machines_list') return textResult(await listMachineDetails());
