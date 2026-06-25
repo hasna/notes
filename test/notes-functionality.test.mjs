@@ -39,6 +39,7 @@ import {
   CHAT_TOOL_SCHEMAS,
   executeNotesAgentTool,
   runNotesAgent,
+  runNotesGoal,
 } from '../tools/notes-agent.mjs';
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -311,6 +312,7 @@ async function freePort() {
 
 async function startSidecar(t, env = {}) {
   const port = await freePort();
+  const token = env.HASNA_NOTES_SIDECAR_TOKEN || 'test-sidecar-token';
   const child = spawn(process.execPath, [join(repoRoot, 'ai-sidecar', 'server.mjs')], {
     cwd: repoRoot,
     env: {
@@ -319,6 +321,7 @@ async function startSidecar(t, env = {}) {
       PORT: String(port),
       OPENAI_API_KEY: '',
       ELEVENLABS_API_KEY: '',
+      HASNA_NOTES_SIDECAR_TOKEN: token,
       ...env,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -341,7 +344,7 @@ async function startSidecar(t, env = {}) {
     if (child.exitCode !== null) break;
     try {
       await health();
-      return { port, child, health };
+      return { port, child, health, token };
     } catch {
       await delay(100);
     }
@@ -501,6 +504,34 @@ test('web markdown bridge preserves literal transcript text and command escaping
   );
 });
 
+test('voice transcript is committed verbatim without stray markdown backslashes', async () => {
+  const app = await readFile(join(repoRoot, 'web', 'app.js'), 'utf8');
+  const { windowTarget } = loadWebAppWithFakeDOM(app);
+  const rec = windowTarget.HasnaNotes.recording;
+  const md = windowTarget.HasnaNotes.markdown;
+
+  // Spoken text full of ordinary punctuation that markdownSafeText would have escaped:
+  // periods, hyphens, parens, exclamation, plus a multi-line dictation.
+  const spoken = 'Meet at 3.5 p.m. - bring the well-being notes (important)!\nFollow up with finance.';
+
+  const body = rec.transcriptBody(spoken);
+
+  // No backslash is ever introduced into a plain transcript.
+  assert.doesNotMatch(body, /\\/);
+  // The text — including its newline — survives byte-for-byte (only trimmed/CRLF-normalized).
+  assert.equal(body, spoken);
+
+  // And it stays clean once rendered (regression guard: the editor/agent render path
+  // must not surface the old "3\\.5 p\\.m\\." escaping artifacts).
+  const rendered = md.render(body);
+  assert.doesNotMatch(rendered, /\\/);
+  assert.match(rendered, /3\.5 p\.m\. - bring the well-being notes \(important\)!/);
+
+  // Document the precise regression: the markdown-escaper (still correct for typed
+  // commands/links) WOULD have inserted backslashes — the transcript path must not use it.
+  assert.match(md.safeText(spoken), /3\\\.5/);
+});
+
 test('agent tool schemas expose read write and confirmation safety boundaries', () => {
   const byName = new Map(CHAT_TOOL_SCHEMAS.map(tool => [tool.name, tool]));
   assert.equal(byName.get('search_notes').safety.readOnly, true);
@@ -508,6 +539,11 @@ test('agent tool schemas expose read write and confirmation safety boundaries', 
   assert.equal(byName.get('create_note').safety.mutates, true);
   assert.equal(byName.get('consolidate_notes').safety.requiresConfirmation, true);
   assert.equal(byName.get('trash_note').safety.requiresConfirmation, true);
+  assert.equal(byName.get('move_note').safety.requiresConfirmation, true);
+  assert.equal(byName.get('list_labels').safety.readOnly, true);
+  assert.equal(byName.get('create_label').safety.mutates, true);
+  assert.equal(byName.get('update_label').safety.requiresConfirmation, true);
+  assert.equal(byName.get('delete_label').safety.requiresConfirmation, true);
 });
 
 test('agent read search summarize and related flows cite source notes', async (t) => {
@@ -629,6 +665,60 @@ test('agent write tools preview unsafe changes and apply confirmed create append
   assert.match(consolidated.body, /Source One/);
 });
 
+test('agent label move and goal flows use shared safe tools', async (t) => {
+  const root = await tempRoot(t);
+  const note = await saveNote({
+    id: uuidFor(225),
+    title: 'Goal Source',
+    body: 'Alpha goal source body.',
+    labels: ['alpha'],
+    machine: 'apple03',
+  }, root);
+
+  const createdLabel = await executeNotesAgentTool('create_label', { name: 'empty-label' }, { root });
+  assert.ok(createdLabel.labels.includes('empty-label'));
+
+  const labelList = await executeNotesAgentTool('list_labels', {}, { root });
+  assert.ok(labelList.items.some(item => item.name === 'empty-label' && item.count === 0));
+
+  const renamePreview = await executeNotesAgentTool('update_label', { oldName: 'ALPHA', newName: 'beta' }, { root });
+  assert.equal(renamePreview.requiresConfirmation, true);
+  assert.deepEqual((await getNote(note.id, root)).labels, ['alpha']);
+
+  const renameConfirmed = await executeNotesAgentTool('update_label', { oldName: 'ALPHA', newName: 'beta', confirm: true }, { root });
+  assert.ok(renameConfirmed.labels.includes('beta'));
+  assert.deepEqual((await getNote(note.id, root)).labels, ['beta']);
+
+  const deletePreview = await executeNotesAgentTool('delete_label', { name: 'BETA' }, { root });
+  assert.equal(deletePreview.requiresConfirmation, true);
+  assert.deepEqual(deletePreview.preview.affectedNoteIds, [note.id]);
+
+  const deleteConfirmed = await executeNotesAgentTool('delete_label', { name: 'BETA', confirm: true }, { root });
+  assert.equal(deleteConfirmed.labels.includes('beta'), false);
+  assert.deepEqual((await getNote(note.id, root)).labels, []);
+
+  await assignLabel(note.id, 'beta', root);
+
+  const movePreview = await runNotesAgent(`move ${note.id} to apple04`, { root });
+  assert.equal(movePreview.status, 'awaiting_confirmation');
+  assert.equal(movePreview.toolCalls[0].name, 'move_note');
+  assert.equal((await getNote(note.id, root)).machine, 'apple03');
+
+  const moveConfirmed = await runNotesAgent(`move ${note.id} to apple04`, { root, yes: true, confirmWrites: true });
+  assert.equal(moveConfirmed.status, 'complete');
+  assert.equal((await getNote(note.id, root)).machine, 'apple04');
+
+  const goal = await runNotesGoal('summarize beta notes', { root, maxSteps: 3 });
+  assert.equal(goal.mode, 'goal');
+  assert.equal(goal.status, 'done');
+  assert.equal(goal.goal.objective, 'summarize beta notes');
+  assert.ok(goal.goal.steps.length >= 1);
+
+  const slashGoal = await runNotesAgent('/goal summarize beta notes', { root, maxSteps: 2 });
+  assert.equal(slashGoal.mode, 'goal');
+  assert.equal(slashGoal.goal.status, 'done');
+});
+
 test('web chat bridge emits tool source and confirmation events', async () => {
   const app = await readFile(join(repoRoot, 'web', 'app.js'), 'utf8');
   const { windowTarget } = loadWebAppWithFakeDOM(app);
@@ -673,6 +763,52 @@ test('web chat bridge emits tool source and confirmation events', async () => {
   assert.equal(approved.note.title, 'Consolidated Notes');
   assert.equal(windowTarget.HasnaNotes.chat.state().status, 'ready');
   assert.equal(windowTarget.HasnaNotes.chat.state().toolCalls[0].state, 'result');
+});
+
+test('web navigation exposes Chat below New Note and Labels page operations', async () => {
+  const html = await readFile(join(repoRoot, 'web', 'index.html'), 'utf8');
+  const app = await readFile(join(repoRoot, 'web', 'app.js'), 'utf8');
+  assert.ok(html.indexOf('id="new-note"') < html.indexOf('id="nav-chat"'));
+  assert.ok(html.indexOf('id="nav-chat"') < html.indexOf('id="nav-labels"'));
+  assert.match(html, /id="chat-page"/);
+  assert.match(html, /id="labels-page-main"/);
+
+  const { windowTarget } = loadWebAppWithFakeDOM(app);
+  windowTarget.HasnaNotes.hydrate({
+    thisMachine: 'apple03',
+    labels: ['empty'],
+    notes: [
+      { id: 'labels-1', title: 'Labelled', body: 'Body', labels: ['work'], status: 'active', machine: 'apple03', updatedAt: '2026-06-23T10:00:00Z', createdAt: '2026-06-23T09:00:00Z' },
+    ],
+    machines: [{ id: 'apple03' }],
+  });
+
+  const labelPairs = JSON.parse(JSON.stringify(windowTarget.HasnaNotes.labels.list().map(item => [item.name, item.count])));
+  assert.deepEqual(labelPairs, [['empty', 0], ['work', 1]]);
+  windowTarget.HasnaNotes.labels.create('later');
+  assert.ok(windowTarget.HasnaNotes.labels.list().some(item => item.name === 'later' && item.count === 0));
+  windowTarget.HasnaNotes.labels.rename('work', 'project');
+  assert.ok(windowTarget.HasnaNotes.labels.list().some(item => item.name === 'project' && item.count === 1));
+  windowTarget.HasnaNotes.labels.delete('project', true);
+  assert.equal(windowTarget.HasnaNotes.labels.list().some(item => item.name === 'project'), false);
+});
+
+test('web chat slash goal keeps visible goal state in local fallback', async () => {
+  const app = await readFile(join(repoRoot, 'web', 'app.js'), 'utf8');
+  const { windowTarget } = loadWebAppWithFakeDOM(app);
+  windowTarget.HasnaNotes.hydrate({
+    thisMachine: 'apple03',
+    notes: [
+      { id: 'goal-1', title: 'Alpha Goal', body: 'Alpha goal body.', labels: ['alpha'], status: 'active', machine: 'apple03', updatedAt: '2026-06-23T10:00:00Z', createdAt: '2026-06-23T09:00:00Z' },
+    ],
+    machines: [{ id: 'apple03' }],
+  });
+
+  const result = await windowTarget.HasnaNotes.chat.send('/goal summarize alpha notes');
+  assert.equal(result.mode, 'goal');
+  assert.equal(result.goal.status, 'done');
+  assert.equal(windowTarget.HasnaNotes.chat.state().goal.objective, 'summarize alpha notes');
+  assert.ok(windowTarget.HasnaNotes.chat.state().goal.steps.length >= 1);
 });
 
 test('web note action bridge confirms trash and permanent purge', async () => {
@@ -790,11 +926,11 @@ test('labels can be assigned, renamed, listed, and deleted', async (t) => {
   assert.deepEqual((await getNote(id, root)).labels, ['Project']);
   assert.deepEqual(await loadLabelList(root), ['Project']);
 
-  await renameLabel('Project', 'Research', root);
+  await renameLabel('project', 'Research', root);
   assert.deepEqual((await getNote(id, root)).labels, ['Research']);
   assert.deepEqual(await loadLabelList(root), ['Research']);
 
-  await deleteLabelEverywhere('Research', root);
+  await deleteLabelEverywhere('research', root);
   assert.deepEqual((await getNote(id, root)).labels, []);
   assert.deepEqual(await loadLabelList(root), []);
 });
@@ -1155,6 +1291,7 @@ test('MCP server exposes notes and labels tools over stdio framing', async (t) =
   assert.ok(listTools.result.tools.some(tool => tool.name === 'markdown_render'));
   assert.ok(listTools.result.tools.some(tool => tool.name === 'markdown_apply_command'));
   assert.ok(listTools.result.tools.some(tool => tool.name === 'agent_run'));
+  assert.ok(listTools.result.tools.some(tool => tool.name === 'agent_goal'));
   assert.ok(listTools.result.tools.some(tool => tool.name === 'agent_tool_call'));
 
   const created = await client.send(3, 'tools/call', {
@@ -1219,6 +1356,13 @@ test('MCP server exposes notes and labels tools over stdio framing', async (t) =
   });
   assert.match(parseToolText(agentRun).text, /Summary of/);
   assert.equal(parseToolText(agentRun).sources.length, 1);
+
+  const agentGoal = await client.send(16, 'tools/call', {
+    name: 'agent_goal',
+    arguments: { objective: 'summarize notes', maxSteps: 2 },
+  });
+  assert.equal(parseToolText(agentGoal).mode, 'goal');
+  assert.equal(parseToolText(agentGoal).goal.status, 'done');
 
   const agentAppendPreview = await client.send(13, 'tools/call', {
     name: 'agent_tool_call',
@@ -1345,6 +1489,7 @@ test('native window drag strip uses local hit testing and performDrag', async ()
 
 test('recording and realtime transcription contracts are exposed to UI/native host', async () => {
   const app = await readFile(join(repoRoot, 'web', 'app.js'), 'utf8');
+  const swift = await readFile(join(repoRoot, 'Sources', 'HasnaNotesApp', 'main.swift'), 'utf8');
   assert.match(app, /hasna:recording-state/);
   assert.match(app, /hasna:recording-progress/);
   assert.match(app, /hasna:transcript-delta/);
@@ -1364,7 +1509,13 @@ test('recording and realtime transcription contracts are exposed to UI/native ho
   const sidecar = await readFile(join(repoRoot, 'ai-sidecar', 'server.mjs'), 'utf8');
   assert.match(sidecar, /\/realtime-transcribe/);
   assert.match(sidecar, /\/chat/);
+  assert.match(sidecar, /\/tool/);
+  assert.match(sidecar, /HASNA_NOTES_SIDECAR_TOKEN/);
+  assert.match(sidecar, /requireSidecarAuth/);
+  assert.match(sidecar, /consumeApproval/);
   assert.match(sidecar, /streamText/);
+  assert.match(sidecar, /ToolLoopAgent/);
+  assert.match(sidecar, /executeNotesAgentTool/);
   assert.match(sidecar, /stepCountIs/);
   assert.match(sidecar, /openaiPartials/);
   assert.match(sidecar, /transcript\.delta/);
@@ -1386,6 +1537,15 @@ test('recording and realtime transcription contracts are exposed to UI/native ho
   assert.match(app, /moveToMachine/);
   assert.match(app, /setTrashRetentionDays/);
   assert.match(app, /postNative\('settings'/);
+  assert.match(app, /id="nav-chat"|nav-chat/);
+  assert.match(app, /sendSidecarChat/);
+  assert.match(app, /X-Hasna-Notes-Token/);
+  assert.match(swift, /HASNA_NOTES_SIDECAR_TOKEN/);
+  assert.match(swift, /"token": sidecar\.token/);
+
+  const buildScript = await readFile(join(repoRoot, 'scripts', 'build_hasnanotes.sh'), 'utf8');
+  assert.match(buildScript, /\$RESOURCES\/tools/);
+  assert.match(buildScript, /notes-agent\.mjs/);
 });
 
 test('sidecar keeps bounded and realtime transcription models in separate slots', async (t) => {
@@ -1419,6 +1579,76 @@ test('sidecar keeps bounded and realtime transcription models in separate slots'
   const cheapHealth = await cheap.health();
   assert.equal(cheapHealth.transcribeModel, 'gpt-4o-mini-transcribe');
   assert.equal(cheapHealth.realtimeModels.openaiSession, 'gpt-realtime');
+});
+
+test('sidecar approval tool endpoint executes shared note tools without model access', async (t) => {
+  const root = await tempRoot(t);
+  const sidecar = await startSidecar(t, { HASNA_NOTES_ROOT: root });
+
+  const unauthorized = await fetch(`http://127.0.0.1:${sidecar.port}/tool`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      name: 'create_note',
+      input: { title: 'Rejected Sidecar Tool Note', body: 'No token.' },
+      confirm: true,
+    }),
+  });
+  assert.equal(unauthorized.status, 401);
+  assert.equal((await loadNotes(root)).length, 0);
+
+  const created = await fetch(`http://127.0.0.1:${sidecar.port}/tool`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Hasna-Notes-Token': sidecar.token },
+    body: JSON.stringify({
+      name: 'create_note',
+      input: { title: 'Sidecar Tool Note', body: 'Created without model.', labels: ['sidecar'] },
+      confirm: true,
+    }),
+  });
+  assert.equal(created.status, 200);
+  const createdBody = await created.json();
+  assert.equal(createdBody.note.title, 'Sidecar Tool Note');
+  assert.equal((await loadNotes(root)).length, 1);
+
+  const preview = await fetch(`http://127.0.0.1:${sidecar.port}/tool`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Hasna-Notes-Token': sidecar.token },
+    body: JSON.stringify({
+      name: 'trash_note',
+      input: { id: createdBody.note.id },
+      confirm: false,
+    }),
+  });
+  assert.equal(preview.status, 200);
+  const previewBody = await preview.json();
+  assert.equal(previewBody.requiresConfirmation, true);
+  assert.equal((await getNote(createdBody.note.id, root)).status, 'active');
+
+  const unboundConfirm = await fetch(`http://127.0.0.1:${sidecar.port}/tool`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Hasna-Notes-Token': sidecar.token },
+    body: JSON.stringify({
+      name: 'trash_note',
+      input: { id: createdBody.note.id },
+      confirm: true,
+    }),
+  });
+  assert.equal(unboundConfirm.status, 409);
+  assert.equal((await getNote(createdBody.note.id, root)).status, 'active');
+
+  const confirmed = await fetch(`http://127.0.0.1:${sidecar.port}/tool`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Hasna-Notes-Token': sidecar.token },
+    body: JSON.stringify({
+      name: 'trash_note',
+      input: { id: createdBody.note.id },
+      confirm: true,
+      approvalId: previewBody.approval.id,
+    }),
+  });
+  assert.equal(confirmed.status, 200);
+  assert.equal((await getNote(createdBody.note.id, root)).status, 'trash');
 });
 
 test('web machine selection and move-to-machine jump to destination context', async () => {

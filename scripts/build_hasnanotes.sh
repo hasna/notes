@@ -48,6 +48,10 @@ cp "$SIDECAR_SRC/server.mjs" "$SIDECAR_SRC/package.json" "$RESOURCES/ai-sidecar/
 if [[ -f "$SIDECAR_SRC/bun.lock" ]]; then
   cp "$SIDECAR_SRC/bun.lock" "$RESOURCES/ai-sidecar/"
 fi
+# server.mjs imports the shared disk-backed notes tool registry via ../tools.
+rm -rf "$RESOURCES/tools"
+mkdir -p "$RESOURCES/tools"
+cp "$REPO_ROOT/tools/notes-agent.mjs" "$REPO_ROOT/tools/notes-lib.mjs" "$RESOURCES/tools/"
 SOURCE_NODE_MODULES_OK=0
 if [[ -d "$SIDECAR_SRC/node_modules" \
   && -f "$SIDECAR_SRC/node_modules/ai/dist/index.mjs" \

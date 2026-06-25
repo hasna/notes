@@ -32,6 +32,10 @@ const SCREENS = [
   // UI/UX polish-pass screens:
   'sidebar', 'home-copy', 'recording', 'recording-paused', 'editor-recording',
   'settings-recording', 'transcript',
+  // Notes page (full list) + Machines under Settings + inline record-in-pill:
+  'noteslist', 'machines-settings', 'qn-record', 'qn-typing',
+  // Dark-theme verification + sidebar overflow (thin scrollbar near the edge):
+  'dark-home', 'dark-recording', 'sidebar-scroll',
 ]
 const want = process.argv.slice(2)
 const screens = want.length ? want : SCREENS
@@ -44,14 +48,14 @@ const browser = await chromium.launch()
 async function fakeRecording(page, { paused = false, transcript = null } = {}) {
   await page.evaluate((opts) => {
     // Drive the public state machine the way the host would, then force the UI.
-    const wrap = document.querySelector('.rec-wrap')
+    // The record control now lives INSIDE the quick-note pill (#qn-form).
+    const wrap = document.getElementById('qn-form')
     if (wrap) { wrap.classList.add('recording'); if (opts.paused) wrap.classList.add('paused') }
     const recBtn = document.getElementById('rec-btn')
+    if (recBtn) recBtn.hidden = false
     // Reach into the module via the exposed surface where possible; fall back to DOM.
     const timerIn = document.getElementById('rec-timer-in')
     if (timerIn) timerIn.textContent = '0:42'
-    const pause = document.getElementById('rec-pause')
-    if (pause) { pause.hidden = false; pause.title = opts.paused ? 'Resume' : 'Pause' }
     // Persistent pill — fixed, on every screen.
     const pill = document.getElementById('rec-pill')
     if (pill) {
@@ -122,6 +126,19 @@ async function freshPage(nativeMode = false, aiAvailable = null) {
   return { ctx, page }
 }
 
+// Force the persisted dark theme BEFORE app.js runs so initTheme() applies it on boot.
+async function darkPage(aiAvailable = true) {
+  const ctx = await browser.newContext({ viewport: VIEWPORT, deviceScaleFactor: SCALE, colorScheme: 'dark' })
+  const page = await ctx.newPage()
+  await page.addInitScript((available) => {
+    try { localStorage.setItem('hasna-notes-theme', 'dark') } catch (e) {}
+    window.__AI__ = { port: 8765, available: available }
+  }, aiAvailable)
+  await page.goto(indexURL, { waitUntil: 'networkidle' })
+  await page.waitForTimeout(250)
+  return { ctx, page }
+}
+
 async function shoot(page, name) {
   const out = resolve(outDir, `${name}.png`)
   await page.screenshot({ path: out })
@@ -150,6 +167,64 @@ for (const s of screens) {
     await page.locator('#open-settings').click()
     await page.waitForTimeout(150)
     await shoot(page, 'settings')
+    await ctx.close()
+  } else if (s === 'noteslist') {
+    // The dedicated full Notes page, reached from the sidebar "View more" / Home "All notes".
+    const ctx = await browser.newContext({ viewport: VIEWPORT, deviceScaleFactor: SCALE })
+    const page = await ctx.newPage()
+    await manyNotesBoot(page)
+    await page.goto(indexURL, { waitUntil: 'networkidle' })
+    await page.waitForTimeout(200)
+    await page.locator('#home-all-notes').click()
+    await page.waitForTimeout(200)
+    await shoot(page, 'noteslist')
+    await ctx.close()
+  } else if (s === 'machines-settings') {
+    // The fuller Machines list living under Settings → Machines.
+    const ctx = await browser.newContext({ viewport: VIEWPORT, deviceScaleFactor: SCALE })
+    const page = await ctx.newPage()
+    await manyNotesBoot(page)
+    await page.goto(indexURL, { waitUntil: 'networkidle' })
+    await page.waitForTimeout(200)
+    await page.locator('#open-settings').click()
+    await page.locator('.set-item[data-tab="machines"]').click()
+    await page.waitForTimeout(200)
+    await shoot(page, 'machines-settings')
+    await ctx.close()
+  } else if (s === 'qn-record') {
+    // Quick-note pill idle: the embedded purple "Record" control.
+    const { ctx, page } = await freshPage(false, true)
+    await page.waitForTimeout(150)
+    await shoot(page, 'qn-record')
+    await ctx.close()
+  } else if (s === 'qn-typing') {
+    // Quick-note pill with text typed → the control switches to Add (submit).
+    const { ctx, page } = await freshPage(false, true)
+    await page.locator('#qn-input').fill('Pick up groceries after work')
+    await page.waitForTimeout(150)
+    await shoot(page, 'qn-typing')
+    await ctx.close()
+  } else if (s === 'dark-home') {
+    const { ctx, page } = await darkPage(true)
+    await shoot(page, 'dark-home')
+    await ctx.close()
+  } else if (s === 'dark-recording') {
+    const { ctx, page } = await darkPage(true)
+    await fakeRecording(page, { paused: false })
+    await page.waitForTimeout(150)
+    await shoot(page, 'dark-recording')
+    await ctx.close()
+  } else if (s === 'sidebar-scroll') {
+    // Many notes/machines so the sidebar nav overflows → the thin scrollbar shows near
+    // the sidebar's right edge. Force a scroll so the bar is rendered.
+    const ctx = await browser.newContext({ viewport: { width: 1280, height: 560 }, deviceScaleFactor: SCALE })
+    const page = await ctx.newPage()
+    await manyNotesBoot(page)
+    await page.goto(indexURL, { waitUntil: 'networkidle' })
+    await page.waitForTimeout(200)
+    await page.evaluate(() => { const n = document.querySelector('.sidebar-nav'); if (n) n.scrollTop = 80 })
+    await page.waitForTimeout(150)
+    await shoot(page, 'sidebar-scroll')
     await ctx.close()
   } else if (s === 'native') {
     const { ctx, page } = await freshPage(true)

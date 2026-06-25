@@ -59,6 +59,7 @@ Usage:
   hasna-notes markdown plain-text <id> [--json]
   hasna-notes markdown apply-command <command-id> --text markdown [--selection-start n] [--selection-end n] [--url href] [--json]
   hasna-notes agent "prompt" [--json] [--yes] [--dry-run] [--actor-name name]
+  hasna-notes chat "/goal organize renewal notes" [--json] [--yes]
   hasna-notes agent tools [--json]
   hasna-notes settings get [--json]
   hasna-notes settings set-trash-retention <days> [--json]
@@ -68,7 +69,7 @@ Usage:
   hasna-notes labels delete <name>
   hasna-notes labels assign <note-id> <name>
   hasna-notes labels unassign <note-id> <name>
-  hasna-notes title <id> [--apply] [--force] [--sidecar http://127.0.0.1:8765] [--json]
+  hasna-notes title <id> [--apply] [--force] [--sidecar http://127.0.0.1:8765] [--sidecar-token token] [--json]
 
 Data root defaults to ${dataRoot()} and can be overridden with HASNA_NOTES_ROOT.`;
 }
@@ -467,7 +468,7 @@ async function commandTitle(id, opts) {
   const note = await getNote(requireArg(id, 'id'));
   if (!note) throw new Error('note_not_found');
   const text = note.body || '';
-  const result = await generateTitle(text, { sidecar: opts.sidecar });
+  const result = await generateTitle(text, { sidecar: opts.sidecar, sidecarToken: opts['sidecar-token'] });
   const fingerprint = contentFingerprint(markdownPlainText(text));
   if (opts.apply) {
     if (note.titleLocked && !opts.force) throw new Error('title_locked');
