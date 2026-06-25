@@ -79,6 +79,34 @@ function pickTimestamp(entry, keys) {
   return '';
 }
 
+function hasObjectKeys(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length > 0;
+}
+
+function paginationFrom(value, fallback = {}) {
+  const p = objectValue(value);
+  const limit = parsePositiveInt(p.limit, parsePositiveInt(fallback.limit, 10));
+  const offset = Math.max(0, Number(p.offset ?? fallback.offset ?? 0));
+  const total = Math.max(0, Number(p.total ?? fallback.total ?? 0));
+  const count = Math.max(0, Number(p.count ?? fallback.count ?? 0));
+  const nextOffsetRaw = p.nextOffset ?? p.next_offset ?? fallback.nextOffset;
+  const nextOffset = Number.isFinite(Number(nextOffsetRaw)) ? Number(nextOffsetRaw) : offset + count;
+  const hasMore = typeof p.hasMore === 'boolean' ? p.hasMore
+    : typeof p.has_more === 'boolean' ? p.has_more
+      : offset + count < total;
+  return {
+    limit,
+    offset,
+    total,
+    count,
+    hasMore,
+    nextOffset,
+    has_more: hasMore,
+    next_offset: nextOffset,
+    order: p.order || fallback.order || 'updated_at_desc',
+  };
+}
+
 function maxISO(values) {
   let max = '';
   for (const value of values) {
@@ -874,21 +902,23 @@ export async function purgeExpiredTrash(root = dataRoot(), now = new Date()) {
 }
 
 export async function renameLabel(oldName, newName, root = dataRoot()) {
-  const labels = (await loadLabelList(root)).map(l => l === oldName ? newName : l);
+  const oldKey = String(oldName).toLowerCase();
+  const labels = (await loadLabelList(root)).map(l => l.toLowerCase() === oldKey ? newName : l);
   await saveLabelList(labels, root);
   for (const note of await loadNotes(root)) {
-    if (!note.labels.includes(oldName)) continue;
-    note.labels = normalizeLabels(note.labels.map(l => l === oldName ? newName : l));
+    if (!note.labels.some(l => l.toLowerCase() === oldKey)) continue;
+    note.labels = normalizeLabels(note.labels.map(l => l.toLowerCase() === oldKey ? newName : l));
     note.updatedAt = new Date().toISOString();
     await saveNote(note, root);
   }
 }
 
 export async function deleteLabelEverywhere(name, root = dataRoot()) {
-  await saveLabelList((await loadLabelList(root)).filter(l => l !== name), root);
+  const key = String(name).toLowerCase();
+  await saveLabelList((await loadLabelList(root)).filter(l => l.toLowerCase() !== key), root);
   for (const note of await loadNotes(root)) {
-    if (!note.labels.includes(name)) continue;
-    note.labels = note.labels.filter(l => l !== name);
+    if (!note.labels.some(l => l.toLowerCase() === key)) continue;
+    note.labels = note.labels.filter(l => l.toLowerCase() !== key);
     note.updatedAt = new Date().toISOString();
     await saveNote(note, root);
   }
@@ -907,7 +937,8 @@ export async function assignLabel(id, label, root = dataRoot()) {
 export async function unassignLabel(id, label, root = dataRoot()) {
   const note = (await loadNotes(root)).find(n => n.id.toLowerCase() === String(id).toLowerCase());
   if (!note) throw new Error('note_not_found');
-  note.labels = note.labels.filter(l => l !== label);
+  const key = String(label).toLowerCase();
+  note.labels = note.labels.filter(l => l.toLowerCase() !== key);
   note.updatedAt = new Date().toISOString();
   await saveNote(note, root);
   return note;
@@ -951,9 +982,12 @@ export function heuristicTitle(text) {
 export async function generateTitle(text, opts = {}) {
   const readable = markdownPlainText(text) || String(text || '').trim();
   if (opts.sidecar) {
+    const token = opts.sidecarToken || process.env.HASNA_NOTES_SIDECAR_TOKEN || '';
+    const headers = { 'Content-Type': 'application/json' };
+    if (token) headers['X-Hasna-Notes-Token'] = token;
     const res = await fetch(String(opts.sidecar).replace(/\/$/, '') + '/title', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({ text: readable }),
     });
     if (res.ok) {

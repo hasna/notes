@@ -1,12 +1,15 @@
 import {
   archiveNote,
   assignLabel,
+  deleteLabelEverywhere,
   getNote,
   loadLabelList,
   listNotes,
   loadNotes,
   markdownPlainText,
+  moveNoteToMachine,
   normalizeLabels,
+  renameLabel,
   restoreNote,
   saveLabelList,
   saveNote,
@@ -51,10 +54,13 @@ export const CHAT_TOOL_SCHEMAS = [
     labels: { type: 'array', items: { type: 'string' } },
     targetMachine: { type: 'string' },
   }, { mutates: true }),
-  toolSchema('update_note', 'Replace title and/or body for one note. Requires confirmation.', {
+  toolSchema('update_note', 'Replace title, body, labels, folder, or status for one note. Requires confirmation.', {
     id: { type: 'string' },
     title: { type: 'string' },
     body: { type: 'string' },
+    labels: { type: 'array', items: { type: 'string' } },
+    folder: { type: 'string' },
+    status: { type: 'string' },
   }, { required: ['id'], mutates: true, requiresConfirmation: true }),
   toolSchema('append_note', 'Append Markdown text to one note. Requires confirmation.', {
     id: { type: 'string' },
@@ -71,6 +77,22 @@ export const CHAT_TOOL_SCHEMAS = [
   toolSchema('archive_note', 'Archive one note. Requires confirmation.', { id: { type: 'string' } }, { required: ['id'], mutates: true, requiresConfirmation: true }),
   toolSchema('trash_note', 'Move one note to Trash. Requires confirmation.', { id: { type: 'string' } }, { required: ['id'], mutates: true, requiresConfirmation: true }),
   toolSchema('restore_note', 'Restore one archived or trashed note. Requires confirmation.', { id: { type: 'string' } }, { required: ['id'], mutates: true, requiresConfirmation: true }),
+  toolSchema('move_note', 'Move one note to another machine while preserving origin metadata. Requires confirmation.', {
+    id: { type: 'string' },
+    machine: { type: 'string' },
+    machineName: { type: 'string' },
+  }, { required: ['id', 'machine'], mutates: true, requiresConfirmation: true }),
+  toolSchema('list_labels', 'List all known labels, including empty persisted labels.', {}, { readOnly: true }),
+  toolSchema('create_label', 'Create an empty label without assigning it to a note.', {
+    name: { type: 'string' },
+  }, { required: ['name'], mutates: true }),
+  toolSchema('update_label', 'Rename a label everywhere. Requires confirmation.', {
+    oldName: { type: 'string' },
+    newName: { type: 'string' },
+  }, { required: ['oldName', 'newName'], mutates: true, requiresConfirmation: true }),
+  toolSchema('delete_label', 'Delete a label and remove it from notes. Requires confirmation.', {
+    name: { type: 'string' },
+  }, { required: ['name'], mutates: true, requiresConfirmation: true }),
   toolSchema('summarize_notes', 'Summarize selected, searched, or all visible notes.', {
     ids: { type: 'array', items: { type: 'string' } },
     query: { type: 'string' },
@@ -245,6 +267,20 @@ function sourceContext(options) {
   };
 }
 
+function normalizeStatus(value, fallback = 'active') {
+  const status = String(value || fallback).trim().toLowerCase();
+  return ['inbox', 'active', 'reviewed', 'promoted', 'archived', 'trash', 'stale'].includes(status)
+    ? status
+    : fallback;
+}
+
+function labelCount(labels, notes) {
+  return labels.map(name => ({
+    name,
+    count: notes.filter(note => (note.labels || []).some(label => label.toLowerCase() === name.toLowerCase())).length,
+  }));
+}
+
 export async function executeNotesAgentTool(toolName, args = {}, options = {}) {
   const root = options.root;
   const name = String(toolName || '');
@@ -313,11 +349,26 @@ export async function executeNotesAgentTool(toolName, args = {}, options = {}) {
     if (!note) throw new Error('note_not_found');
     return withPreview(name, args, options, async () => ({
       id: note.id,
-      before: { title: note.title, bodyPreview: compactBody(note, 240) },
-      after: { title: args.title ?? note.title, bodyPreview: String(args.body ?? note.body).slice(0, 240) },
+      before: {
+        title: note.title,
+        bodyPreview: compactBody(note, 240),
+        labels: note.labels || [],
+        folder: note.folder || '',
+        status: note.status || 'active',
+      },
+      after: {
+        title: args.title ?? note.title,
+        bodyPreview: String(args.body ?? note.body).slice(0, 240),
+        labels: args.labels ?? note.labels ?? [],
+        folder: args.folder ?? note.folder ?? '',
+        status: args.status ? normalizeStatus(args.status, note.status || 'active') : note.status || 'active',
+      },
     }), async () => {
       if (args.title != null) note.title = String(args.title);
       if (args.body != null) note.body = String(args.body);
+      if (args.labels != null) note.labels = normalizeLabels(args.labels);
+      if (args.folder != null) note.folder = String(args.folder || '');
+      if (args.status != null) note.status = normalizeStatus(args.status, note.status || 'active');
       note.updatedAt = new Date().toISOString();
       await saveNote(note, root);
       return { note, sources: [noteReference(note)] };
@@ -374,6 +425,70 @@ export async function executeNotesAgentTool(toolName, args = {}, options = {}) {
           ? await trashNote(note.id, {}, root)
           : await restoreNote(note.id, root);
       return { note: changed, sources: [noteReference(changed)] };
+    });
+  }
+
+  if (name === 'move_note') {
+    const note = await getNote(requireArg(args, 'id'), root);
+    if (!note) throw new Error('note_not_found');
+    const machine = String(requireArg(args, 'machine')).trim();
+    return withPreview(name, args, options, async () => ({
+      id: note.id,
+      title: note.title,
+      fromMachine: note.machine || '',
+      toMachine: machine,
+      machineName: args.machineName || '',
+    }), async () => {
+      const changed = await moveNoteToMachine(note.id, machine, { targetMachineFriendlyName: args.machineName }, root);
+      return { note: changed, sources: [noteReference(changed)] };
+    });
+  }
+
+  if (name === 'list_labels') {
+    const labels = await loadLabelList(root);
+    const notes = await loadNotes(root);
+    return { labels, items: labelCount(labels, notes) };
+  }
+
+  if (name === 'create_label') {
+    const label = requireArg(args, 'name');
+    if (options.dryRun) {
+      return dryRunResult(name, args, { name: label });
+    }
+    await saveLabelList([...(await loadLabelList(root)), label], root);
+    const labels = await loadLabelList(root);
+    return { labels, items: labelCount(labels, await loadNotes(root)) };
+  }
+
+  if (name === 'update_label') {
+    const oldName = requireArg(args, 'oldName');
+    const newName = requireArg(args, 'newName');
+    const notes = await loadNotes(root);
+    return withPreview(name, args, options, async () => ({
+      oldName,
+      newName,
+      affectedNoteIds: notes
+        .filter(note => (note.labels || []).some(label => label.toLowerCase() === String(oldName).toLowerCase()))
+        .map(note => note.id),
+    }), async () => {
+      await renameLabel(oldName, newName, root);
+      const labels = await loadLabelList(root);
+      return { labels, items: labelCount(labels, await loadNotes(root)) };
+    });
+  }
+
+  if (name === 'delete_label') {
+    const label = requireArg(args, 'name');
+    const notes = await loadNotes(root);
+    return withPreview(name, args, options, async () => ({
+      name: label,
+      affectedNoteIds: notes
+        .filter(note => (note.labels || []).some(item => item.toLowerCase() === String(label).toLowerCase()))
+        .map(note => note.id),
+    }), async () => {
+      await deleteLabelEverywhere(label, root);
+      const labels = await loadLabelList(root);
+      return { labels, items: labelCount(labels, await loadNotes(root)) };
     });
   }
 
@@ -492,15 +607,139 @@ async function runTool(toolName, args, options, toolCalls) {
   toolCalls.push(toolCall);
   emit(options, 'tool-call', toolCall);
   const result = await executeNotesAgentTool(toolName, args, options);
-  const finished = { ...toolCall, state: result.requiresConfirmation ? 'approval-requested' : 'result', result };
-  emit(options, 'tool-result', finished);
+  toolCall.state = result.requiresConfirmation ? 'approval-requested' : 'result';
+  toolCall.result = result;
+  emit(options, 'tool-result', toolCall);
   if (result.requiresConfirmation) emit(options, 'confirmation', result.approval);
   return result;
+}
+
+export function parseGoalCommand(prompt) {
+  const text = String(prompt || '').trim();
+  const match = /^\/goal(?:\s+begin)?\s+([\s\S]+)$/i.exec(text);
+  return match ? match[1].trim() : '';
+}
+
+function goalNeedsInput(result) {
+  return !!(result?.pendingConfirmations?.length || result?.status === 'awaiting_confirmation');
+}
+
+function goalTerminalFromText(text) {
+  const t = String(text || '').toLowerCase();
+  if (/\b(needs? (user )?input|need you to|please provide|which note|what label|what machine|which machine)\b/.test(t)) {
+    return 'needs_input';
+  }
+  if (/\b(blocked|cannot continue|not possible|unable to proceed)\b/.test(t)) return 'blocked';
+  return '';
+}
+
+function goalFollowupPrompt(objective, stepNumber, previous) {
+  const prior = previous?.text ? `\nPrevious result:\n${previous.text.slice(0, 1200)}` : '';
+  return [
+    `Continue this Hasna Notes goal until it is achieved, needs user input, or is clearly blocked.`,
+    `Goal: ${objective}`,
+    `Step ${stepNumber}: inspect or use the safest next note/label operation. Do not repeat a completed step.${prior}`,
+  ].join('\n');
+}
+
+export async function runNotesGoal(objective, options = {}) {
+  const cleanObjective = String(objective || '').trim();
+  if (!cleanObjective) throw new Error('goal_required');
+  const maxSteps = Math.min(12, Math.max(1, Number(options.maxSteps || 6)));
+  const goal = {
+    id: `goal-${Date.now()}`,
+    objective: cleanObjective,
+    status: 'running',
+    maxSteps,
+    steps: [],
+    blocker: '',
+    needsInput: '',
+  };
+  emit(options, 'goal-state', goal);
+
+  let previous = null;
+  for (let index = 0; index < maxSteps; index += 1) {
+    const stepNumber = index + 1;
+    const prompt = index === 0 ? cleanObjective : goalFollowupPrompt(cleanObjective, stepNumber, previous);
+    emit(options, 'goal-step', { goalId: goal.id, stepNumber, status: 'running', prompt });
+    const result = await runNotesAgent(prompt, { ...options, _skipGoalParsing: true });
+    const terminal = goalTerminalFromText(result.text);
+    const step = {
+      stepNumber,
+      status: goalNeedsInput(result) ? 'needs_input' : terminal || 'complete',
+      text: result.text,
+      toolCalls: result.toolCalls || [],
+      sources: result.sources || [],
+      pendingConfirmations: result.pendingConfirmations || [],
+    };
+    goal.steps.push(step);
+    previous = result;
+    emit(options, 'goal-step', { goalId: goal.id, ...step });
+
+    if (goalNeedsInput(result)) {
+      goal.status = 'needs_input';
+      goal.needsInput = 'A tool call requires approval before the goal can continue.';
+      goal.pendingConfirmations = result.pendingConfirmations || [];
+      emit(options, 'goal-state', goal);
+      return {
+        ...result,
+        id: goal.id,
+        mode: 'goal',
+        status: 'needs_input',
+        goal,
+        text: `${result.text}\n\nGoal paused for approval before continuing.`,
+      };
+    }
+    if (terminal === 'needs_input') {
+      goal.status = 'needs_input';
+      goal.needsInput = result.text;
+      emit(options, 'goal-state', goal);
+      return { ...result, id: goal.id, mode: 'goal', status: 'needs_input', goal };
+    }
+    if (terminal === 'blocked') {
+      goal.status = 'blocked';
+      goal.blocker = result.text;
+      emit(options, 'goal-state', goal);
+      return { ...result, id: goal.id, mode: 'goal', status: 'blocked', goal };
+    }
+
+    const mutatingSuccess = (result.toolCalls || []).some(call => (
+      call.state === 'result' &&
+      call.result &&
+      !call.result.requiresConfirmation &&
+      !call.result.dryRun &&
+      ['create_note', 'update_note', 'append_note', 'label_note', 'unlabel_note', 'archive_note', 'trash_note', 'restore_note', 'move_note', 'create_label', 'update_label', 'delete_label', 'consolidate_notes'].includes(call.name)
+    ));
+    const readOnlyComplete = index > 0 || /\b(summarize|summary|search|find|list|read|show|info|metadata|provenance|related|similar)\b/i.test(cleanObjective);
+    if (mutatingSuccess || readOnlyComplete) {
+      goal.status = 'done';
+      emit(options, 'goal-state', goal);
+      return { ...result, id: goal.id, mode: 'goal', status: 'done', goal };
+    }
+  }
+
+  goal.status = 'blocked';
+  goal.blocker = `Stopped after ${maxSteps} goal steps without a clear completion signal.`;
+  emit(options, 'goal-state', goal);
+  return {
+    id: goal.id,
+    mode: 'goal',
+    status: 'blocked',
+    provider: 'local-tools',
+    text: goal.blocker,
+    toolCalls: previous?.toolCalls || [],
+    sources: previous?.sources || [],
+    pendingConfirmations: previous?.pendingConfirmations || [],
+    goal,
+  };
 }
 
 export async function runNotesAgent(prompt, options = {}) {
   const text = String(prompt || '').trim();
   if (!text) throw new Error('prompt_required');
+  const goalObjective = options._skipGoalParsing ? '' : parseGoalCommand(text);
+  if (goalObjective) return runNotesGoal(goalObjective, options);
+
   const toolCalls = [];
   emit(options, 'state', { status: 'submitted' });
   emit(options, 'state', { status: 'streaming' });
@@ -512,7 +751,28 @@ export async function runNotesAgent(prompt, options = {}) {
   const wantsConfirm = !!(options.confirmWrites || options.yes);
   const lower = text.toLowerCase();
 
-  if (/\b(consolidate|organize|roll up|combine)\b/.test(lower)) {
+  if (/\b(list|show)\b.*\blabels?\b/.test(lower) || /^labels?$/i.test(text)) {
+    result = await runTool('list_labels', {}, options, toolCalls);
+    answer = result.items.length
+      ? 'Labels:\n' + result.items.map(item => `- ${item.name} (${item.count})`).join('\n')
+      : 'No labels yet.';
+  } else if (/\b(create|add|new)\b.*\blabel\b/.test(lower)) {
+    const label = extractLabel(text) || options.label || /(?:label)\s+["“]?([^"”]+)["”]?$/i.exec(text)?.[1]?.trim();
+    if (!label) throw new Error('label_required');
+    result = await runTool('create_label', { name: label }, options, toolCalls);
+    answer = result.dryRun ? `Create-label preview ready for "${label}".` : `Created label "${label}".`;
+  } else if (/\b(rename|update)\b.*\blabel\b/.test(lower)) {
+    const oldName = options.oldName || /(?:rename|update)\s+label\s+["“]?([^"”]+?)["”]?\s+(?:to|as)\s+["“]?([^"”]+)["”]?$/i.exec(text)?.[1]?.trim();
+    const newName = options.newName || /(?:rename|update)\s+label\s+["“]?([^"”]+?)["”]?\s+(?:to|as)\s+["“]?([^"”]+)["”]?$/i.exec(text)?.[2]?.trim();
+    if (!oldName || !newName) throw new Error('label_rename_args_required');
+    result = await runTool('update_label', { oldName, newName, confirm: wantsConfirm }, { ...options, confirmWrites: wantsConfirm }, toolCalls);
+    answer = result.requiresConfirmation ? `Rename-label preview ready for "${oldName}".` : `Renamed label "${oldName}" to "${newName}".`;
+  } else if (/\b(delete|remove)\b.*\blabel\b/.test(lower) && !id) {
+    const label = extractLabel(text) || options.label;
+    if (!label) throw new Error('label_required');
+    result = await runTool('delete_label', { name: label, confirm: wantsConfirm }, { ...options, confirmWrites: wantsConfirm }, toolCalls);
+    answer = result.requiresConfirmation ? `Delete-label preview ready for "${label}".` : `Deleted label "${label}".`;
+  } else if (/\b(consolidate|organize|roll up|combine)\b/.test(lower)) {
     result = await runTool('consolidate_notes', {
       query: query || undefined,
       all: !query,
@@ -577,6 +837,11 @@ export async function runNotesAgent(prompt, options = {}) {
   } else if (/\brestore\b/.test(lower) && id) {
     result = await runTool('restore_note', { id, confirm: wantsConfirm }, { ...options, confirmWrites: wantsConfirm }, toolCalls);
     answer = result.requiresConfirmation ? `Restore preview ready for ${id}.` : `Restored "${result.note.title}".`;
+  } else if (/\bmove\b/.test(lower) && id) {
+    const machine = options.machine || options.targetMachine || /\b(?:to|machine)\s+([A-Za-z0-9._-]+)\b/i.exec(text)?.[1]?.trim();
+    if (!machine) throw new Error('machine_required');
+    result = await runTool('move_note', { id, machine, machineName: options.machineName, confirm: wantsConfirm }, { ...options, confirmWrites: wantsConfirm }, toolCalls);
+    answer = result.requiresConfirmation ? `Move preview ready for ${id}.` : `Moved "${result.note.title}" to ${machine}.`;
   } else {
     result = await runTool(query ? 'search_notes' : 'list_notes', query ? { query, limit: options.limit || 10 } : { limit: options.limit || 10 }, options, toolCalls);
     answer = result.items.length
@@ -584,7 +849,10 @@ export async function runNotesAgent(prompt, options = {}) {
       : 'No matching notes found.';
   }
 
-  const sources = result.sources || result.items?.map(noteReference) || (result.note ? [noteReference(result.note)] : []);
+  let sources = [];
+  if (Array.isArray(result.sources)) sources = result.sources;
+  else if (Array.isArray(result.items) && result.items.every(item => item && item.id)) sources = result.items.map(noteReference);
+  else if (result.note) sources = [noteReference(result.note)];
   emit(options, 'delta', { text: answer });
   emit(options, 'sources', { sources });
   const response = {

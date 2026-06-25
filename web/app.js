@@ -76,17 +76,18 @@
   const DEFAULT_TITLES = ['', 'New Note', 'Untitled Note'];
   const state = {
     notes: [],            // [{id,title,body,labels,status,folder,machine,updatedAt,createdAt}]
+    labels: [],           // persisted labels from labels.json; note labels are still source for counts
     machines: [],         // [{id}]
     thisMachine: 'unknown',
     selectedId: null,     // currently-open note id (or null = empty state)
     machineFilter: ALL,   // ALL or a machine id
     labelFilter: ALL,     // ALL or a label name (UI-only forward-compatible filter)
     query: '',            // search text
-    screen: 'home',       // 'home' | 'notes' | 'settings' | 'compact'
+    screen: 'home',       // 'home' | 'chat' | 'labels' | 'notes' | 'noteslist' | 'settings' | 'compact'
     statusFilter: 'active', // active | archived | trash | all
-    noteListLimit: 10,
-    machineListLimit: 10,
-    recentLimit: 10,      // Home recent cards default count (View more reveals +10)
+    noteListLimit: 6,     // sidebar Notes list; "View more" opens the full Notes page
+    machineListLimit: 4,  // sidebar Machines list; "View more" opens Settings → Machines
+    recentLimit: 3,       // Home recent cards — kept deliberately light (no inline expand)
     settings: { trashRetentionDays: 30 },
     chat: {
       id: 'chat-local',
@@ -96,6 +97,7 @@
       sources: [],
       pendingConfirmations: [],
       error: '',
+      goal: null,
     },
   };
 
@@ -123,11 +125,18 @@
       available: !!a.available,
       realtime: !!a.realtime,
       realtimeProvider: a.realtimeProvider || 'openai',
+      token: a.token || '',
     };
   }
   function aiURL(path) {
     const { port } = ai();
     return 'http://127.0.0.1:' + port + path;
+  }
+  function aiHeaders(extra) {
+    const headers = Object.assign({ 'Content-Type': 'application/json' }, extra || {});
+    const token = ai().token;
+    if (token) headers['X-Hasna-Notes-Token'] = token;
+    return headers;
   }
 
   // ------------------------------------------------------------------ dom helpers
@@ -180,6 +189,19 @@
   function noteLabels(n) {
     const raw = (n && Array.isArray(n.labels) && n.labels.length) ? n.labels : (n && n.tags) || [];
     return Array.isArray(raw) ? raw.filter(Boolean).map(String) : [];
+  }
+
+  function normalizeLabelList(labels) {
+    const seen = Object.create(null);
+    const out = [];
+    (labels || []).forEach(raw => {
+      const label = String(raw || '').trim();
+      const key = label.toLowerCase();
+      if (!label || seen[key]) return;
+      seen[key] = true;
+      out.push(label);
+    });
+    return out;
   }
 
   function defaultProvenance(machine) {
@@ -255,6 +277,15 @@
 
   function markdownSafeText(text) {
     return String(text || '').replace(/\\/g, '\\\\').replace(/([`*_{}\[\]()#+\-.!>|])/g, '\\$1');
+  }
+
+  // Spoken transcripts are plain prose, NOT markdown the user typed — they must be
+  // stored verbatim. Running them through markdownSafeText() inserted stray backslashes
+  // before ordinary punctuation ("3.5" → "3\.5", "well-being" → "well\-being",
+  // "(note)" → "\(note\)"), which is the transcription-backslash bug. Normalize CRLF
+  // and trim the ends, but otherwise preserve the text and its line breaks byte-for-byte.
+  function transcriptToNoteBody(text) {
+    return String(text || '').replace(/\r\n/g, '\n').trim();
   }
 
   function escapeHTML(text) {
@@ -455,6 +486,7 @@
   // The distinct label set across all notes, with counts, sorted by name.
   function allLabels() {
     const counts = Object.create(null);
+    state.labels.forEach(label => { counts[label] = counts[label] || 0; });
     state.notes.forEach(n => { noteLabels(n).forEach(l => { counts[l] = (counts[l] || 0) + 1; }); });
     return Object.keys(counts).sort((a, b) => a.localeCompare(b)).map(name => ({ name: name, count: counts[name] }));
   }
@@ -716,6 +748,33 @@
     }
   }
 
+  // The native host overlays a transparent drag strip across the FULL header band so the
+  // window is movable by its header (the WKWebView alone swallows drags). That strip would
+  // also swallow clicks on the header controls — so we report each interactive control's
+  // viewport rect (CSS px, top-left origin) to native, which punches matching pass-through
+  // holes in the strip. Controls opt in with `data-no-drag`. Recomputed on layout changes.
+  function reportDragExclusions() {
+    if (!nativeWindow()) return;
+    try {
+      const rects = [];
+      document.querySelectorAll('[data-no-drag]').forEach((el) => {
+        const r = el.getBoundingClientRect();
+        // Skip controls in the hidden shell (display:none ⇒ zero-size rect).
+        if (r.width <= 0 || r.height <= 0) return;
+        rects.push({ x: r.left, y: r.top, w: r.width, h: r.height });
+      });
+      postWindow('dragExclusions', { rects: rects });
+    } catch (e) { /* host gone — ignore */ }
+  }
+
+  // Coalesce bursts (resize, shell switch, render) into one report per frame.
+  let _dragExclRAF = 0;
+  function scheduleDragExclusions() {
+    if (!nativeWindow()) return;
+    if (_dragExclRAF) return;
+    _dragExclRAF = requestAnimationFrame(() => { _dragExclRAF = 0; reportDragExclusions(); });
+  }
+
   // ------------------------------------------------------------------ toast
   let toastTimer = null;
   function toast(msg) {
@@ -798,20 +857,63 @@
   function renderNavActive() {
     const home = $('nav-home');
     if (home) home.classList.toggle('active', state.screen === 'home');
+    const chat = $('nav-chat');
+    if (chat) chat.classList.toggle('active', state.screen === 'chat');
+    const labels = $('nav-labels');
+    if (labels) labels.classList.toggle('active', state.screen === 'labels');
   }
 
-  // Decide which content panel is visible: Home, or the note editor / empty states.
+  // Decide which content panel is visible: Home, Chat, Labels, the full Notes page, or the editor.
   function renderContent() {
     const home = $('home-state');
-    if (state.screen === 'home') {
-      if (home) home.hidden = false;
-      const ed = $('editor'), empty = $('empty-state'), nomatch = $('nomatch-state');
+    const np = $('notes-page');
+    const chat = $('chat-page');
+    const labels = $('labels-page-main');
+    const ed = $('editor'), empty = $('empty-state'), nomatch = $('nomatch-state');
+    const hideEditorStates = () => {
       if (ed) ed.hidden = true;
       if (empty) empty.hidden = true;
       if (nomatch) nomatch.hidden = true;
+    };
+    if (state.screen === 'home') {
+      if (home) home.hidden = false;
+      if (np) np.hidden = true;
+      if (chat) chat.hidden = true;
+      if (labels) labels.hidden = true;
+      hideEditorStates();
+      return;
+    }
+    if (state.screen === 'chat') {
+      if (home) home.hidden = true;
+      if (np) np.hidden = true;
+      if (chat) chat.hidden = false;
+      if (labels) labels.hidden = true;
+      hideEditorStates();
+      renderChatPage();
+      return;
+    }
+    if (state.screen === 'labels') {
+      if (home) home.hidden = true;
+      if (np) np.hidden = true;
+      if (chat) chat.hidden = true;
+      if (labels) labels.hidden = false;
+      hideEditorStates();
+      renderLabelsPage();
+      return;
+    }
+    if (state.screen === 'noteslist') {
+      if (home) home.hidden = true;
+      if (np) np.hidden = false;
+      if (chat) chat.hidden = true;
+      if (labels) labels.hidden = true;
+      hideEditorStates();
+      renderNotesPage();
       return;
     }
     if (home) home.hidden = true;
+    if (np) np.hidden = true;
+    if (chat) chat.hidden = true;
+    if (labels) labels.hidden = true;
     renderEditor();
   }
 
@@ -822,11 +924,12 @@
     if (!wrap || !host) return;
     const allRecent = sortNotes(state.notes.filter(n => n.status !== 'trash' && n.status !== 'archived'));
     const recent = allRecent.slice(0, state.recentLimit);
-    const more = $('recent-more');
     host.innerHTML = '';
+    // "All notes" affordance: only worth showing once there are more than the recent few.
+    const allBtn = $('home-all-notes');
+    if (allBtn) allBtn.hidden = allRecent.length <= state.recentLimit;
     if (recent.length === 0) {
       wrap.hidden = true;
-      if (more) more.hidden = true;
       return;
     }
     wrap.hidden = false;
@@ -836,8 +939,10 @@
       card.dataset.noteId = n.id;
       card.dataset.copyText = body;
       card.appendChild(el('div', 'home-card-title', (n.title && n.title.trim()) || 'Untitled Note'));
-      const sub = body.replace(/\s+/g, ' ').trim().slice(0, 80) || 'No content';
-      card.appendChild(el('div', 'home-card-sub', sub + ' · ' + relTime(n.updatedAt)));
+      const sub = body.replace(/\s+/g, ' ').trim().slice(0, 72) || 'No content';
+      card.appendChild(el('div', 'home-card-sub', sub));
+      // Relative time on its own third row so it never crowds the preview text.
+      card.appendChild(el('div', 'home-card-meta', relTime(n.updatedAt)));
 
       // Hover copy button (top-right, absolute → no layout shift) + inline "Copied" tag.
       const copied = el('span', 'home-card-copied', 'Copied');
@@ -858,7 +963,192 @@
       card.addEventListener('click', () => selectNote(n.id));
       host.appendChild(card);
     });
-    if (more) more.hidden = allRecent.length <= state.recentLimit;
+  }
+
+  // Friendly, abbreviated relative time for note rows/cards ("Just now", "3m", "2h",
+  // "Yesterday", "4d", or a short date). Trimmed so it never crowds a row.
+  function noteRowTime(iso) {
+    return relTimeShort(iso) || '';
+  }
+
+  // ------------------------------------------------------------------ Notes page
+  // The dedicated full-list page reached from the sidebar "View more" / Home "All notes".
+  function showNotesPage() {
+    commitEdit();
+    state.screen = 'noteslist';
+    showApp();
+    render();
+  }
+
+  function showChatPage() {
+    commitEdit();
+    state.screen = 'chat';
+    showApp();
+    render();
+    const input = $('chat-input'); if (input) input.focus();
+  }
+
+  function showLabelsPage() {
+    commitEdit();
+    state.screen = 'labels';
+    showApp();
+    render();
+    const input = $('label-create-input'); if (input) input.focus();
+  }
+
+  function renderNotesPage() {
+    const host = $('np-list');
+    const countEl = $('np-count');
+    const emptyEl = $('np-empty');
+    if (!host) return;
+    host.innerHTML = '';
+    const list = sortNotes(state.notes.filter(n => n.status !== 'trash' && n.status !== 'archived'));
+    if (countEl) countEl.textContent = list.length === 1 ? '1 note' : list.length + ' notes';
+    if (emptyEl) emptyEl.hidden = list.length !== 0;
+    list.forEach(n => {
+      const row = el('div', 'np-row');
+      row.dataset.id = n.id;
+      const body = (n.body || n.content || '').replace(/\s+/g, ' ').trim();
+      row.appendChild(el('div', 'np-row-title', (n.title && n.title.trim()) || 'Untitled Note'));
+      row.appendChild(el('div', 'np-row-sub', body.slice(0, 120) || 'No content'));
+      // Third row: machine + friendly relative time, kept compact and muted.
+      const meta = el('div', 'np-row-meta');
+      const machine = (n.sourceMachineFriendlyName || n.machine || '').trim();
+      if (machine && machine !== 'unknown') meta.appendChild(el('span', 'np-row-machine', machine));
+      const age = relTime(n.updatedAt);
+      if (age) meta.appendChild(el('span', 'np-row-age', age));
+      row.appendChild(meta);
+      row.addEventListener('click', () => selectNote(n.id));
+      row.addEventListener('contextmenu', (e) => { e.preventDefault(); openContextMenu(e, n.id); });
+      host.appendChild(row);
+    });
+  }
+
+  // ------------------------------------------------------------------ Machines page
+  // The fuller machines list lives under Settings → Machines (kept off the Home page).
+  function renderMachinesPage() {
+    const host = $('machines-page');
+    const emptyEl = $('machines-page-empty');
+    if (!host) return;
+    host.innerHTML = '';
+    const machines = machineDetailsList();
+    if (emptyEl) emptyEl.hidden = machines.length !== 0;
+    machines.forEach(m => {
+      const card = el('div', 'mp-row');
+      const left = el('div', 'mp-left');
+      const name = (m.displayName || m.id || 'Unknown machine').trim();
+      left.appendChild(el('div', 'mp-name', name));
+      const sub = [];
+      if (m.platform) sub.push(m.platform);
+      const seen = m.recentActivityAt || m.latestNoteUpdatedAt || m.updatedAt;
+      if (seen) sub.push('Active ' + relTime(seen));
+      left.appendChild(el('div', 'mp-sub', sub.join(' · ') || 'No recent activity'));
+      card.appendChild(left);
+      const count = Number(m.noteCount || 0);
+      card.appendChild(el('span', 'mp-count', count === 1 ? '1 note' : count + ' notes'));
+      // Clicking a machine filters the sidebar list to it and returns to the app.
+      card.addEventListener('click', () => { selectMachine(m.id, { reason: 'settings' }); showApp(); });
+      host.appendChild(card);
+    });
+  }
+
+  // ------------------------------------------------------------------ Labels page
+  function persistLabels() {
+    state.labels = normalizeLabelList(state.labels);
+    postNative('labels', { labels: state.labels });
+  }
+
+  function rememberLabels(labels) {
+    state.labels = normalizeLabelList([].concat(state.labels || [], labels || []));
+  }
+
+  function createLabelLocal(name) {
+    const label = String(name || '').trim();
+    if (!label) return null;
+    rememberLabels([label]);
+    persistLabels();
+    render();
+    return label;
+  }
+
+  function renameLabelLocal(oldName, newName) {
+    const from = String(oldName || '').trim();
+    const to = String(newName || '').trim();
+    if (!from || !to) return null;
+    state.labels = normalizeLabelList(state.labels.map(label => label.toLowerCase() === from.toLowerCase() ? to : label).concat([to]));
+    state.notes.forEach(note => {
+      const next = normalizeLabelList(noteLabels(note).map(label => label.toLowerCase() === from.toLowerCase() ? to : label));
+      if (next.join('\n') !== noteLabels(note).join('\n')) {
+        note.labels = next;
+        note.updatedAt = new Date().toISOString();
+        postNative('save', serializeNote(note));
+      }
+    });
+    if (state.labelFilter.toLowerCase && state.labelFilter.toLowerCase() === from.toLowerCase()) state.labelFilter = to;
+    persistLabels();
+    render();
+    return to;
+  }
+
+  function deleteLabelLocal(name, confirmed) {
+    const label = String(name || '').trim();
+    if (!label) return null;
+    const affected = state.notes.filter(note => noteLabels(note).some(item => item.toLowerCase() === label.toLowerCase()));
+    if (!confirmed && affected.length && !window.confirm('Delete label "' + label + '" from ' + affected.length + ' note(s)?')) return null;
+    state.labels = state.labels.filter(item => item.toLowerCase() !== label.toLowerCase());
+    affected.forEach(note => {
+      note.labels = noteLabels(note).filter(item => item.toLowerCase() !== label.toLowerCase());
+      note.updatedAt = new Date().toISOString();
+      postNative('save', serializeNote(note));
+    });
+    if (state.labelFilter.toLowerCase && state.labelFilter.toLowerCase() === label.toLowerCase()) state.labelFilter = ALL;
+    persistLabels();
+    render();
+    return { label, affected: affected.length };
+  }
+
+  function renderLabelsPage() {
+    const host = $('labels-page-list');
+    const countEl = $('labels-count');
+    const emptyEl = $('labels-page-empty');
+    if (!host) return;
+    const labels = allLabels();
+    host.innerHTML = '';
+    if (countEl) countEl.textContent = labels.length === 1 ? '1 label' : labels.length + ' labels';
+    if (emptyEl) emptyEl.hidden = labels.length !== 0;
+    labels.forEach(item => {
+      const row = el('div', 'lp-row');
+      row.dataset.label = item.name;
+      const left = el('button', 'lp-main');
+      left.type = 'button';
+      left.title = 'Filter notes';
+      left.innerHTML = '<span class="lp-tag-ico"><svg viewBox="0 0 16 16" fill="none"><path d="M6.8 2.4h4.4a1.4 1.4 0 011.4 1.4v4.4L8 13 3 8l3.8-5.6z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/><circle cx="10.1" cy="5.5" r=".8" fill="currentColor"/></svg></span>';
+      left.appendChild(el('span', 'lp-name', item.name));
+      left.appendChild(el('span', 'lp-count', item.count === 1 ? '1 note' : item.count + ' notes'));
+      left.addEventListener('click', () => {
+        state.labelFilter = item.name;
+        showNotesPage();
+      });
+      row.appendChild(left);
+      const actions = el('div', 'lp-actions');
+      const edit = el('button', 'lp-icon');
+      edit.type = 'button';
+      edit.title = 'Rename label';
+      edit.innerHTML = '<svg viewBox="0 0 18 18" fill="none"><path d="M4 13.5V15h1.5l7.8-7.8-1.5-1.5L4 13.5z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M12.4 4.8l1.8 1.8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>';
+      edit.addEventListener('click', () => {
+        const next = window.prompt('Rename label', item.name);
+        if (next && next.trim() && next.trim() !== item.name) renameLabelLocal(item.name, next.trim());
+      });
+      const del = el('button', 'lp-icon lp-danger');
+      del.type = 'button';
+      del.title = 'Delete label';
+      del.innerHTML = '<svg viewBox="0 0 18 18" fill="none"><path d="M4 5.5h10M7.5 5.5V4.2a1 1 0 011-1h1a1 1 0 011 1v1.3M5.5 5.5l.6 8a1 1 0 001 .94h3.8a1 1 0 001-.94l.6-8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+      del.addEventListener('click', () => deleteLabelLocal(item.name, false));
+      actions.appendChild(edit);
+      actions.appendChild(del);
+      row.appendChild(actions);
+      host.appendChild(row);
+    });
   }
 
   // Clipboard write with a textarea fallback (file:// / older WebKit). No toast — the
@@ -924,11 +1214,8 @@
     if (page.hasMore) {
       const more = el('button', 'view-more', 'View more');
       more.type = 'button';
-      more.addEventListener('click', () => {
-        state.noteListLimit += 10;
-        renderNotesList();
-        renderEditor();
-      });
+      // Navigate to the dedicated Notes page rather than expanding the sidebar inline.
+      more.addEventListener('click', showNotesPage);
       host.appendChild(more);
     }
   }
@@ -1115,7 +1402,7 @@
     autoTitled[id] = fp;                              // mark BEFORE the request for this body
     fetch(aiURL('/title'), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: aiHeaders(),
       body: JSON.stringify({ text: readable }),
     })
       .then(r => r.ok ? r.json() : null)
@@ -1290,7 +1577,7 @@
   }
 
   // ------------------------------------------------------------------ settings + theme
-  const SETTINGS_TABS = ['appearance', 'about'];
+  const SETTINGS_TABS = ['appearance', 'machines', 'about'];
   const win = $('window');
 
   function showSettings(tab) {
@@ -1303,6 +1590,7 @@
     document.querySelectorAll('.set-page').forEach(p => p.classList.remove('active'));
     const page = document.querySelector('.set-page[data-tab="' + t + '"]');
     if (page) page.classList.add('active');
+    if (t === 'machines') renderMachinesPage();
   }
 
   function showApp() {
@@ -1333,6 +1621,8 @@
       showApp();
       render();
     }
+    // The visible header controls differ per shell — refresh the native drag holes.
+    scheduleDragExclusions();
   }
 
   // Theme: persisted in localStorage, applied as data-theme on <html>. "system"
@@ -1823,10 +2113,11 @@
   // pause/resume side control, the persistent fixed recording pill (every screen), and the
   // transcript surface. No "Record voice note" / "tap to stop" labels.
 	  function setRecUI(stateName) {
-    const wrap = document.querySelector('.rec-wrap');
+    // The recording control now lives INSIDE the quick-note pill; pause/stop controls
+    // live in the persistent bottom pill (no duplicate large surface on Home).
+    const wrap = $('qn-form');
     const recBtn = $('rec-btn');
     const timerIn = $('rec-timer-in');
-    const pauseBtn = $('rec-pause');
 	    const active = (stateName === 'recording' || stateName === 'paused' || stateName === 'stopping' || stateName === 'transcribing');
 
 	    if (wrap) {
@@ -1839,15 +2130,12 @@
 	      else if (stateName === 'error') wrap.classList.add('error');
 	    }
 	    if (timerIn && active) timerIn.textContent = stateName === 'transcribing' ? '' : recElapsed();
-	    if (pauseBtn) {
-	      pauseBtn.hidden = !(stateName === 'recording' || stateName === 'paused');
-	      pauseBtn.title = (stateName === 'paused') ? 'Resume' : 'Pause';
-	    }
     if (recBtn) {
       const cfg = ai();
       recBtn.setAttribute('aria-label',
 	        active ? (stateName === 'transcribing' ? 'Transcribing recording' : 'Stop recording') : ((cfg.available || cfg.realtime) ? 'Record a voice note' : 'Voice notes need an OpenAI key'));
 	    }
+    updateComposerControls();
     renderRecPill();
     renderTranscript();
   }
@@ -1971,7 +2259,8 @@
     rec.provider = cfg.realtimeProvider || 'openai';
     rec.targetRate = rec.provider === 'elevenlabs' ? 16000 : 24000;
     const wsURL = 'ws://127.0.0.1:' + cfg.port + '/realtime-transcribe?provider=' +
-      encodeURIComponent(rec.provider) + '&sampleRate=' + rec.targetRate;
+      encodeURIComponent(rec.provider) + '&sampleRate=' + rec.targetRate +
+      (cfg.token ? '&token=' + encodeURIComponent(cfg.token) : '');
     const ws = new WebSocket(wsURL);
     rec.ws = ws;
     ws.addEventListener('open', () => {
@@ -2112,7 +2401,7 @@
 	      setRecordingProgress('transcribing-audio', 0.6);
 	      return fetch(aiURL('/transcribe'), {
 	        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: aiHeaders(),
         body: JSON.stringify({ audioBase64: b64, mime: mime }),
       });
 	    }).then(r => {
@@ -2133,7 +2422,7 @@
     stopStream();
     try { if (rec.ws && rec.ws.readyState === WebSocket.OPEN) rec.ws.close(); } catch (e) {}
 	    if (text) {
-	      quickCreate('', markdownSafeText(text));
+	      quickCreate('', transcriptToNoteBody(text));
 	      toast('Voice note added');
 	    } else if (rec.status !== 'error') {
 	      toast('Could not transcribe audio');
@@ -2221,15 +2510,15 @@
 
   function initRecButton() {
     const btn = $('rec-btn');
-    const wrap = document.querySelector('.rec-wrap');
+    const wrap = $('qn-form');
     if (!btn || !wrap) return;
     const cfg = ai();
     if (!cfg.available && !cfg.realtime) {
-      wrap.classList.add('disabled');
+      wrap.classList.add('rec-disabled');
       btn.setAttribute('title', 'Add an OpenAI or ElevenLabs key to enable voice notes');
       btn.setAttribute('aria-disabled', 'true');
     } else {
-      wrap.classList.remove('disabled');
+      wrap.classList.remove('rec-disabled');
       btn.setAttribute('title', 'Record a voice note');
       btn.removeAttribute('aria-disabled');
     }
@@ -2271,17 +2560,33 @@
   function onNewNote(e) { if (e) e.preventDefault(); newNote(); }
   function onDelete(e) { if (e) e.preventDefault(); deleteCurrent(); }
   function onOpenHome(e) { if (e) e.preventDefault(); showHome(); }
+  function onOpenChat(e) { if (e) e.preventDefault(); showChatPage(); }
+  function onOpenLabels(e) { if (e) e.preventDefault(); showLabelsPage(); }
   function onMinimize(e) { if (e) e.preventDefault(); setCompact(true); }
   function onCompactExpand(e) { if (e) e.preventDefault(); setCompact(false); }
+  // "View more" under Machines opens the fuller list in Settings → Machines.
   function onMachinesMore(e) {
     if (e) e.preventDefault();
-    state.machineListLimit += 10;
-    renderMachines();
+    showSettings('machines');
   }
-  function onRecentMore(e) {
+  function onAllNotes(e) { if (e) e.preventDefault(); showNotesPage(); }
+  function onChatSubmit(e) {
     if (e) e.preventDefault();
-    state.recentLimit += 10;
-    renderHome();
+    const input = $('chat-input');
+    if (!input) return;
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = '';
+    sendChat(text).catch(err => toast(err.message || String(err)));
+  }
+  function onLabelCreate(e) {
+    if (e) e.preventDefault();
+    const input = $('label-create-input');
+    if (!input) return;
+    const label = input.value.trim();
+    if (!label) return;
+    createLabelLocal(label);
+    input.value = '';
   }
   // Home quick-note submit: create without navigating, clear, toast.
   function onQuickNote(e) {
@@ -2292,7 +2597,21 @@
     quickCreate(v, '');
     inp.value = '';
     inp.focus();
+    updateComposerControls();
     toast('Note added');
+  }
+  // Toggle the pill's primary control: typed text → Add (submit); empty → Record.
+  function onQnInput() { updateComposerControls(); }
+  function updateComposerControls() {
+    const inp = $('qn-input'); const add = $('qn-add'); const recBtn = $('rec-btn');
+    if (!inp) return;
+    const hasText = !!inp.value.trim();
+    const recActive = (rec.status === 'recording' || rec.status === 'paused' ||
+      rec.status === 'stopping' || rec.status === 'transcribing');
+    // While recording, the Record control stays put (it doubles as Stop); otherwise the
+    // control reflects whether the user is typing (Add) or not (Record).
+    if (add) add.hidden = recActive || !hasText;
+    if (recBtn) recBtn.hidden = !recActive && hasText;
   }
   // Compact quick-note submit: same create-without-navigate + toast.
   function onCompactNote(e) {
@@ -2347,22 +2666,30 @@
 
     // Home + compact + minimize.
     const home = $('nav-home'); if (home) home.addEventListener('click', onOpenHome);
+    const chatNav = $('nav-chat'); if (chatNav) chatNav.addEventListener('click', onOpenChat);
+    const labelsNav = $('nav-labels'); if (labelsNav) labelsNav.addEventListener('click', onOpenLabels);
     const winMin = $('win-min'); if (winMin) winMin.addEventListener('click', onMinimize);
     const cExpand = $('compact-expand'); if (cExpand) cExpand.addEventListener('click', onCompactExpand);
     const qnForm = $('qn-form'); if (qnForm) qnForm.addEventListener('submit', onQuickNote);
+    const qnInput = $('qn-input'); if (qnInput) qnInput.addEventListener('input', onQnInput);
     const cForm = $('compact-form'); if (cForm) cForm.addEventListener('submit', onCompactNote);
+    const chatForm = $('chat-form'); if (chatForm) chatForm.addEventListener('submit', onChatSubmit);
+    const labelForm = $('label-create-form'); if (labelForm) labelForm.addEventListener('submit', onLabelCreate);
     const recBtn = $('rec-btn'); if (recBtn) recBtn.addEventListener('click', onRecordClick);
-    const recPause = $('rec-pause'); if (recPause) recPause.addEventListener('click', onRecPauseToggle);
     const pillPause = $('rec-pill-pause'); if (pillPause) pillPause.addEventListener('click', onRecPauseToggle);
     const pillStop = $('rec-pill-stop'); if (pillStop) pillStop.addEventListener('click', onRecPillStop);
     const machinesMore = $('machines-more'); if (machinesMore) machinesMore.addEventListener('click', onMachinesMore);
-    const recentMore = $('recent-more'); if (recentMore) recentMore.addEventListener('click', onRecentMore);
+    const allNotes = $('home-all-notes'); if (allNotes) allNotes.addEventListener('click', onAllNotes);
 
     // Context menu items + global close handlers.
     document.querySelectorAll('.ctx-item[data-act]').forEach(it => it.addEventListener('click', onCtxAction));
     document.addEventListener('keydown', onGlobalKeydown);
     document.addEventListener('pointerdown', onGlobalPointerDown, true);
     window.addEventListener('scroll', onWindowScroll, true);
+    // Keep the native drag-strip pass-through holes aligned with the header controls as
+    // the window resizes, and report once now that the header is laid out.
+    window.addEventListener('resize', scheduleDragExclusions);
+    scheduleDragExclusions();
 
     const openSet = $('open-settings'); if (openSet) openSet.addEventListener('click', onOpenSettings);
     const back = $('settings-back'); if (back) back.addEventListener('click', onSettingsBack);
@@ -2381,16 +2708,20 @@
     const en = $('empty-new'); if (en) en.removeEventListener('click', onNewNote);
     const del = $('note-delete'); if (del) del.removeEventListener('click', onDelete);
     const home = $('nav-home'); if (home) home.removeEventListener('click', onOpenHome);
+    const chatNav = $('nav-chat'); if (chatNav) chatNav.removeEventListener('click', onOpenChat);
+    const labelsNav = $('nav-labels'); if (labelsNav) labelsNav.removeEventListener('click', onOpenLabels);
     const winMin = $('win-min'); if (winMin) winMin.removeEventListener('click', onMinimize);
     const cExpand = $('compact-expand'); if (cExpand) cExpand.removeEventListener('click', onCompactExpand);
     const qnForm = $('qn-form'); if (qnForm) qnForm.removeEventListener('submit', onQuickNote);
+    const qnInput = $('qn-input'); if (qnInput) qnInput.removeEventListener('input', onQnInput);
     const cForm = $('compact-form'); if (cForm) cForm.removeEventListener('submit', onCompactNote);
+    const chatForm = $('chat-form'); if (chatForm) chatForm.removeEventListener('submit', onChatSubmit);
+    const labelForm = $('label-create-form'); if (labelForm) labelForm.removeEventListener('submit', onLabelCreate);
     const recBtn = $('rec-btn'); if (recBtn) recBtn.removeEventListener('click', onRecordClick);
-    const recPause = $('rec-pause'); if (recPause) recPause.removeEventListener('click', onRecPauseToggle);
     const pillPause = $('rec-pill-pause'); if (pillPause) pillPause.removeEventListener('click', onRecPauseToggle);
     const pillStop = $('rec-pill-stop'); if (pillStop) pillStop.removeEventListener('click', onRecPillStop);
     const machinesMore = $('machines-more'); if (machinesMore) machinesMore.removeEventListener('click', onMachinesMore);
-    const recentMore = $('recent-more'); if (recentMore) recentMore.removeEventListener('click', onRecentMore);
+    const allNotes = $('home-all-notes'); if (allNotes) allNotes.removeEventListener('click', onAllNotes);
     document.querySelectorAll('.ctx-item[data-act]').forEach(it => it.removeEventListener('click', onCtxAction));
     document.removeEventListener('keydown', onGlobalKeydown);
     document.removeEventListener('pointerdown', onGlobalPointerDown, true);
@@ -2407,6 +2738,7 @@
   function adopt(boot) {
     const b = boot || {};
     state.notes = Array.isArray(b.notes) ? b.notes.map(normalizeNote) : [];
+    state.labels = normalizeLabelList([].concat(Array.isArray(b.labels) ? b.labels : [], state.notes.flatMap(note => note.labels || [])));
     state.machines = Array.isArray(b.machines)
       ? b.machines.map(normalizeMachine).filter(m => m.id)
       : [];
@@ -2415,8 +2747,8 @@
       state.settings.trashRetentionDays = Number(b.settings.trashRetentionDays);
     }
     const limit = b.listDefaults && Number(b.listDefaults.limit);
-    state.noteListLimit = limit > 0 ? limit : 10;
-    state.machineListLimit = limit > 0 ? limit : 10;
+    state.noteListLimit = limit > 0 ? limit : 6;
+    state.machineListLimit = 4;
 
     // Keep the open note if it still exists; else newest visible; else null.
     if (!noteById(state.selectedId)) {
@@ -2544,6 +2876,7 @@
       sources: state.chat.sources.slice(),
       pendingConfirmations: state.chat.pendingConfirmations.slice(),
       error: state.chat.error || '',
+      goal: state.chat.goal,
     };
   }
 
@@ -2691,10 +3024,162 @@
     return approval;
   }
 
-  function sendChat(prompt, options) {
+  function chatMessageText(message) {
+    if (!message) return '';
+    if (Array.isArray(message.parts)) {
+      return message.parts.filter(part => part && part.type === 'text').map(part => part.text || '').join('\n');
+    }
+    return String(message.text || message.content || '');
+  }
+
+  function setChatMessageText(message, text) {
+    if (!message.parts) message.parts = [{ type: 'text', text: '' }];
+    if (!message.parts.length) message.parts.push({ type: 'text', text: '' });
+    message.parts[0].type = 'text';
+    message.parts[0].text = String(text || '');
+  }
+
+  function renderChatPage() {
+    const status = $('chat-status');
+    if (status) status.textContent = state.chat.status.replace(/_/g, ' ');
+    renderChatGoal();
+    renderChatLog();
+    renderChatTools();
+    renderChatSources();
+    renderChatApprovals();
+  }
+
+  function renderChatLog() {
+    const host = $('chat-log');
+    if (!host) return;
+    host.innerHTML = '';
+    if (!state.chat.messages.length) {
+      host.appendChild(el('div', 'chat-empty', 'No messages'));
+      return;
+    }
+    state.chat.messages.forEach(message => {
+      const row = el('div', 'chat-msg chat-' + (message.role || 'assistant'));
+      row.appendChild(el('div', 'chat-role', message.role === 'user' ? 'You' : 'Hasna'));
+      row.appendChild(el('div', 'chat-text', chatMessageText(message)));
+      host.appendChild(row);
+    });
+    host.scrollTop = host.scrollHeight || 0;
+  }
+
+  function renderChatTools() {
+    const host = $('chat-tools');
+    if (!host) return;
+    host.innerHTML = '';
+    host.hidden = state.chat.toolCalls.length === 0;
+    state.chat.toolCalls.forEach(call => {
+      const row = el('div', 'ct-row');
+      row.appendChild(el('div', 'ct-name', call.name || call.toolName || 'tool'));
+      row.appendChild(el('div', 'ct-state', call.state || 'call'));
+      const input = el('pre', 'ct-json', JSON.stringify(call.input || {}, null, 2));
+      row.appendChild(input);
+      if (call.result) row.appendChild(el('pre', 'ct-json ct-result', JSON.stringify(call.result, null, 2).slice(0, 1600)));
+      host.appendChild(row);
+    });
+  }
+
+  function renderChatSources() {
+    const host = $('chat-sources');
+    if (!host) return;
+    host.innerHTML = '';
+    host.hidden = state.chat.sources.length === 0;
+    state.chat.sources.forEach(source => {
+      const btn = el('button', 'cs-item');
+      btn.type = 'button';
+      btn.textContent = (source.title || 'Untitled Note') + (source.id ? ' · ' + source.id.slice(0, 8) : '');
+      btn.addEventListener('click', () => { if (source.id) selectNote(source.id); });
+      host.appendChild(btn);
+    });
+  }
+
+  function renderChatApprovals() {
+    const host = $('chat-approvals');
+    if (!host) return;
+    host.innerHTML = '';
+    host.hidden = state.chat.pendingConfirmations.length === 0;
+    state.chat.pendingConfirmations.forEach(approval => {
+      const row = el('div', 'ca-row');
+      row.appendChild(el('div', 'ca-title', approval.toolName || 'Approval'));
+      row.appendChild(el('pre', 'ca-preview', JSON.stringify(approval.preview || approval.input || {}, null, 2).slice(0, 1600)));
+      const actions = el('div', 'ca-actions');
+      const approve = el('button', 'ca-btn ca-primary', 'Approve');
+      approve.type = 'button';
+      approve.addEventListener('click', () => {
+        const out = approveChat(approval.id, true);
+        if (out && typeof out.then === 'function') out.catch(err => toast(err.message || String(err)));
+      });
+      const cancel = el('button', 'ca-btn', 'Cancel');
+      cancel.type = 'button';
+      cancel.addEventListener('click', () => approveChat(approval.id, false));
+      actions.appendChild(approve);
+      actions.appendChild(cancel);
+      row.appendChild(actions);
+      host.appendChild(row);
+    });
+  }
+
+  function renderChatGoal() {
+    const card = $('goal-card');
+    if (!card) return;
+    const goal = state.chat.goal;
+    card.hidden = !goal;
+    if (!goal) return;
+    const title = $('goal-title');
+    const stateEl = $('goal-state');
+    const steps = $('goal-steps');
+    if (title) title.textContent = goal.objective || '';
+    if (stateEl) stateEl.textContent = goal.status || 'running';
+    if (steps) {
+      steps.innerHTML = '';
+      (goal.steps || []).forEach(step => {
+        const row = el('div', 'goal-step');
+        row.appendChild(el('span', 'goal-step-n', String(step.stepNumber || '')));
+        row.appendChild(el('span', 'goal-step-text', step.toolCall ? (step.toolCall.name || 'tool') : (step.text || step.status || 'step')));
+        row.appendChild(el('span', 'goal-step-status', step.status || 'running'));
+        steps.appendChild(row);
+      });
+    }
+  }
+
+  function mergeChatLabels(labels) {
+    if (!Array.isArray(labels)) return;
+    state.labels = normalizeLabelList(labels);
+    renderLabels();
+    if (state.screen === 'labels') renderLabelsPage();
+  }
+
+  function mergeChatNote(note) {
+    if (!note || !note.id) return;
+    const normalized = normalizeNote(note);
+    const idx = state.notes.findIndex(item => item.id === normalized.id);
+    if (idx >= 0) state.notes[idx] = Object.assign(state.notes[idx], normalized);
+    else state.notes.push(normalized);
+    rememberLabels(normalized.labels || []);
+    renderLabels();
+    renderNotesList();
+    renderHome();
+    if (state.screen === 'noteslist') renderNotesPage();
+    if (state.screen === 'labels') renderLabelsPage();
+  }
+
+  function mergeChatToolOutput(output) {
+    if (!output || typeof output !== 'object') return;
+    if (output.note) mergeChatNote(output.note);
+    if (Array.isArray(output.labels)) mergeChatLabels(output.labels);
+    if (Array.isArray(output.sources)) state.chat.sources = output.sources;
+  }
+
+  function sendLocalChat(prompt, options) {
     const text = String(prompt || '').trim();
     if (!text) return Promise.reject(new Error('prompt_required'));
     const opts = options || {};
+    const goalObjective = !opts._skipGoalParsing && parseChatGoalCommand(text);
+    if (goalObjective) return sendLocalGoalChat(goalObjective, opts);
+    if (!opts._skipGoalParsing) state.chat.goal = null;
     const userMessage = { id: 'msg-' + Date.now(), role: 'user', parts: [{ type: 'text', text }] };
     state.chat.messages.push(userMessage);
     state.chat.toolCalls = [];
@@ -2872,11 +3357,299 @@
     });
   }
 
+  function parseChatGoalCommand(prompt) {
+    const m = /^\/goal(?:\s+begin)?\s+([\s\S]+)$/i.exec(String(prompt || '').trim());
+    return m ? m[1].trim() : '';
+  }
+
+  function localGoalTerminalText(text) {
+    const value = String(text || '').toLowerCase();
+    if (/\b(needs? (user )?input|need you to|please provide|which note|what label|what machine|which machine)\b/.test(value)) return 'needs_input';
+    if (/\b(blocked|cannot continue|not possible|unable to proceed)\b/.test(value)) return 'blocked';
+    return '';
+  }
+
+  function localGoalComplete(objective, result, stepIndex) {
+    const toolCalls = result.toolCalls || [];
+    const mutating = new Set(['create_note', 'update_note', 'append_note', 'label_note', 'unlabel_note', 'archive_note', 'trash_note', 'restore_note', 'move_note', 'create_label', 'update_label', 'delete_label', 'consolidate_notes']);
+    const mutatingSuccess = toolCalls.some(call => mutating.has(call.name) && call.state === 'result' && !(call.result && (call.result.requiresConfirmation || call.result.dryRun)));
+    if (mutatingSuccess) return true;
+    const readIntent = /\b(summarize|summary|search|find|list|read|show|info|metadata|provenance|related|similar)\b/i.test(objective);
+    const readTool = toolCalls.some(call => ['list_notes', 'search_notes', 'read_note', 'summarize_notes', 'find_related_notes', 'note_info', 'list_labels'].includes(call.name));
+    return readIntent && readTool && stepIndex > 0;
+  }
+
+  function localGoalFollowup(objective, stepNumber, previous) {
+    return [
+      'Continue this Hasna Notes goal until it is achieved, needs user input, or is clearly blocked.',
+      'Goal: ' + objective,
+      'Step ' + stepNumber + ': inspect or use the safest next notes or labels operation. Do not repeat a completed step.',
+      previous && previous.text ? 'Previous result:\n' + previous.text.slice(0, 900) : '',
+    ].filter(Boolean).join('\n');
+  }
+
+  function sendLocalGoalChat(objective, options) {
+    const goal = {
+      id: 'goal-local-' + Date.now(),
+      objective: String(objective || '').trim(),
+      status: 'running',
+      maxSteps: Math.max(1, Number((options && options.maxSteps) || 4)),
+      steps: [],
+    };
+    state.chat.goal = goal;
+    emitChat('hasna:chat-goal-state', { goal });
+    renderChatGoal();
+    let previous = null;
+    let chain = Promise.resolve();
+    for (let i = 0; i < goal.maxSteps; i += 1) {
+      chain = chain.then(done => {
+        if (done) return done;
+        const stepNumber = i + 1;
+        const prompt = i === 0 ? goal.objective : localGoalFollowup(goal.objective, stepNumber, previous);
+        const runningStep = { stepNumber, status: 'running', text: prompt };
+        goal.steps.push(runningStep);
+        emitChat('hasna:chat-goal-state', { goal });
+        renderChatGoal();
+        return sendLocalChat(prompt, Object.assign({}, options || {}, { _skipGoalParsing: true })).then(result => {
+          previous = result;
+          const terminal = localGoalTerminalText(result.text);
+          runningStep.status = result.pendingConfirmations && result.pendingConfirmations.length ? 'needs_input' : (terminal || 'complete');
+          runningStep.text = result.text;
+          runningStep.toolCalls = result.toolCalls || [];
+          if (runningStep.status === 'needs_input') goal.status = 'needs_input';
+          else if (runningStep.status === 'blocked') goal.status = 'blocked';
+          else if (localGoalComplete(goal.objective, result, i)) goal.status = 'done';
+          if (goal.status !== 'running') {
+            state.chat.goal = goal;
+            result.goal = goal;
+            result.mode = 'goal';
+            emitChat('hasna:chat-goal-state', { goal });
+            renderChatPage();
+            return result;
+          }
+          state.chat.goal = goal;
+          emitChat('hasna:chat-goal-state', { goal });
+          renderChatGoal();
+          return null;
+        });
+      });
+    }
+    return chain.then(result => {
+      if (result) return result;
+      goal.status = 'blocked';
+      goal.blocker = 'Stopped after ' + goal.maxSteps + ' goal steps without a clear completion signal.';
+      state.chat.goal = goal;
+      const blocked = previous || { text: goal.blocker, toolCalls: [], sources: [], pendingConfirmations: [] };
+      blocked.text = goal.blocker;
+      blocked.goal = goal;
+      blocked.mode = 'goal';
+      emitChat('hasna:chat-goal-state', { goal });
+      renderChatPage();
+      return blocked;
+    });
+  }
+
+  function addSidecarApproval(approval, call) {
+    if (!approval || !approval.id) return;
+    if (state.chat.pendingConfirmations.some(item => item.id === approval.id)) return;
+    const enriched = Object.assign({ sidecar: true, toolCallId: call && call.id }, approval);
+    if (!enriched.toolCallId && call) enriched.toolCallId = call.id;
+    state.chat.pendingConfirmations.push(enriched);
+    emitChat('hasna:chat-confirmation', { approval: enriched });
+  }
+
+  function handleSidecarEvent(event, assistantMessage, acc) {
+    if (!event || !event.type) return;
+    if (event.type === 'text-delta') {
+      acc.text += event.text || '';
+      setChatMessageText(assistantMessage, acc.text);
+      emitChat('hasna:chat-delta', { text: event.text || '' });
+      renderChatLog();
+      return;
+    }
+    if (event.type === 'tool-call') {
+      const call = event.toolCall || { id: event.toolCallId, name: event.toolName, input: event.input, state: 'call', sidecar: true };
+      call.id = call.id || event.toolCallId || ('tool-' + (state.chat.toolCalls.length + 1));
+      call.name = call.name || event.toolName;
+      call.state = call.state || 'call';
+      call.sidecar = true;
+      state.chat.toolCalls.push(call);
+      emitChat('hasna:chat-tool-call', { toolCall: call });
+      renderChatTools();
+      return;
+    }
+    if (event.type === 'tool-result') {
+      const call = state.chat.toolCalls.find(item => item.id === event.toolCallId) || state.chat.toolCalls[state.chat.toolCalls.length - 1];
+      if (call) {
+        call.state = event.output && event.output.requiresConfirmation ? 'approval-requested' : 'result';
+        call.result = event.output;
+        emitChat('hasna:chat-tool-result', { toolCall: call });
+      }
+      mergeChatToolOutput(event.output);
+      renderChatTools();
+      renderChatSources();
+      return;
+    }
+    if (event.type === 'confirmation') {
+      const call = state.chat.toolCalls[state.chat.toolCalls.length - 1];
+      addSidecarApproval(event.approval, call);
+      renderChatApprovals();
+      return;
+    }
+    if (event.type === 'goal-state') {
+      state.chat.goal = event.goal;
+      renderChatGoal();
+      return;
+    }
+    if (event.type === 'goal-step') {
+      const goal = state.chat.goal || { objective: parseChatGoalCommand(acc.prompt), status: 'running', steps: [] };
+      const existing = (goal.steps || []).find(step => step.stepNumber === event.stepNumber);
+      if (existing) Object.assign(existing, event);
+      else goal.steps = (goal.steps || []).concat([event]);
+      state.chat.goal = goal;
+      renderChatGoal();
+      return;
+    }
+    if (event.type === 'finish') {
+      if (!acc.text && event.text) {
+        acc.text = event.text;
+        setChatMessageText(assistantMessage, acc.text);
+      }
+      state.chat.messages.forEach(message => { if (message.sidecarPending) delete message.sidecarPending; });
+      if (event.goal) state.chat.goal = event.goal;
+      (event.pendingConfirmations || []).forEach(approval => addSidecarApproval(approval, state.chat.toolCalls[state.chat.toolCalls.length - 1]));
+      emitChat('hasna:chat-sources', { sources: state.chat.sources });
+      emitChat('hasna:chat-message', { message: assistantMessage });
+      const result = {
+        message: assistantMessage,
+        text: acc.text,
+        sources: state.chat.sources.slice(),
+        pendingConfirmations: state.chat.pendingConfirmations.slice(),
+        toolCalls: state.chat.toolCalls.slice(),
+        goal: state.chat.goal,
+      };
+      emitChat('hasna:chat-finish', result);
+      setChatStatus(state.chat.pendingConfirmations.length ? 'awaiting_confirmation' : 'ready');
+      renderChatPage();
+      acc.result = result;
+      return;
+    }
+    if (event.type === 'error') {
+      throw new Error(event.error || 'chat_failed');
+    }
+  }
+
+  async function sendSidecarChat(prompt, options) {
+    if (!window.fetch || !window.TextDecoder) throw new Error('fetch_unavailable');
+    const text = String(prompt || '').trim();
+    if (!text) throw new Error('prompt_required');
+    const opts = options || {};
+    const goalObjective = parseChatGoalCommand(text);
+    const userMessage = { id: 'msg-' + Date.now(), role: 'user', parts: [{ type: 'text', text }], sidecarPending: true };
+    const assistantMessage = { id: 'msg-' + Date.now() + '-assistant', role: 'assistant', parts: [{ type: 'text', text: '' }], metadata: {}, sidecarPending: true };
+    state.chat.messages.push(userMessage);
+    state.chat.messages.push(assistantMessage);
+    state.chat.toolCalls = [];
+    state.chat.sources = [];
+    state.chat.pendingConfirmations = [];
+    state.chat.error = '';
+    state.chat.goal = goalObjective ? { id: 'goal-local-' + Date.now(), objective: goalObjective, status: 'running', steps: [], maxSteps: opts.maxSteps || 10 } : null;
+    emitChat('hasna:chat-message', { message: userMessage });
+    setChatStatus('submitted');
+    setChatStatus('streaming');
+    renderChatPage();
+
+    const response = await fetch(aiURL('/chat'), {
+      method: 'POST',
+      headers: aiHeaders(),
+      body: JSON.stringify({
+        prompt: text,
+        selectedNoteId: opts.noteId || opts.selectedNoteId || state.selectedId || '',
+        labels: allLabels().map(item => item.name),
+        maxSteps: opts.maxSteps || (goalObjective ? 10 : 8),
+        actorName: opts.actorName || 'Hasna Notes Chat',
+        goal: goalObjective ? { objective: goalObjective } : undefined,
+      }),
+    });
+    if (!response.ok || !response.body) throw new Error('chat_sidecar_unavailable');
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    const acc = { text: '', prompt: text, result: null };
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      buffer += decoder.decode(chunk.value, { stream: true });
+      let idx;
+      while ((idx = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, idx).trim();
+        buffer = buffer.slice(idx + 1);
+        if (!line) continue;
+        handleSidecarEvent(JSON.parse(line), assistantMessage, acc);
+      }
+    }
+    if (buffer.trim()) handleSidecarEvent(JSON.parse(buffer.trim()), assistantMessage, acc);
+    return acc.result || {
+      message: assistantMessage,
+      text: acc.text,
+      sources: state.chat.sources.slice(),
+      pendingConfirmations: state.chat.pendingConfirmations.slice(),
+      toolCalls: state.chat.toolCalls.slice(),
+      goal: state.chat.goal,
+    };
+  }
+
+  function sendChat(prompt, options) {
+    const cfg = ai();
+    if (cfg.available && cfg.port && window.fetch) {
+      return sendSidecarChat(prompt, options).catch(err => {
+        state.chat.messages = state.chat.messages.filter(message => !message.sidecarPending);
+        setChatStatus('error', { error: err.message || String(err) });
+        emitChat('hasna:chat-error', { error: err.message || String(err) });
+        return sendLocalChat(prompt, options).then(result => { renderChatPage(); return result; });
+      });
+    }
+    return sendLocalChat(prompt, options).then(result => { renderChatPage(); return result; });
+  }
+
+  async function approveSidecarChat(approval, approved, call) {
+    if (!approved) {
+      if (call) finishChatToolCall(call, { approved: false, approval }, 'cancelled');
+      setChatStatus('ready');
+      renderChatPage();
+      emitChat('hasna:chat-finish', { approved: false, approval });
+      return { approved: false, approval };
+    }
+    const response = await fetch(aiURL('/tool'), {
+      method: 'POST',
+      headers: aiHeaders(),
+      body: JSON.stringify({
+        name: approval.toolName,
+        input: Object.assign({}, approval.input || {}, { confirm: true }),
+        confirm: true,
+        approvalId: approval.id,
+        actorName: 'Hasna Notes Chat',
+        openedFrom: 'chat-approval',
+        sourceContext: approval.id,
+      }),
+    });
+    if (!response.ok) throw new Error('approval_failed');
+    const result = await response.json();
+    mergeChatToolOutput(result);
+    if (call) finishChatToolCall(call, { approved: true, result, approval }, 'result');
+    setChatStatus('ready');
+    renderChatPage();
+    const out = { approved: true, result, approval, note: result.note ? chatNoteRef(result.note) : undefined };
+    emitChat('hasna:chat-finish', out);
+    return out;
+  }
+
   function approveChat(approvalId, approved) {
     const approval = state.chat.pendingConfirmations.find(item => item.id === approvalId);
     if (!approval) return null;
     state.chat.pendingConfirmations = state.chat.pendingConfirmations.filter(item => item.id !== approvalId);
     const call = state.chat.toolCalls.find(item => item.id === approval.toolCallId);
+    if (approval.sidecar) return approveSidecarChat(approval, approved, call);
     if (!approved) {
       if (call) finishChatToolCall(call, { approved: false, approval }, 'cancelled');
       setChatStatus('ready');
@@ -2933,6 +3706,7 @@
     state.chat.sources = [];
     state.chat.pendingConfirmations = [];
     state.chat.error = '';
+    state.chat.goal = null;
     setChatStatus('ready');
     return chatSnapshot();
   }
@@ -3024,6 +3798,12 @@
 	      requestDetails: requestMachineDetails,
 	      receiveDetails: receiveMachineDetails,
 	    },
+    labels: {
+      list: function () { return allLabels(); },
+      create: createLabelLocal,
+      rename: renameLabelLocal,
+      delete: function (name, confirmed) { return deleteLabelLocal(name, !!confirmed); },
+    },
 	    view: {
 	      state: viewSnapshot,
 	    },
@@ -3052,6 +3832,9 @@
       pause: pauseRecording,
       resume: resumeRecording,
       stop: stopRecording,
+      // Exposed so the transcript-commit transformation can be regression-tested
+      // (it must keep spoken punctuation/newlines verbatim — never markdown-escaped).
+      transcriptBody: transcriptToNoteBody,
     },
   };
 
