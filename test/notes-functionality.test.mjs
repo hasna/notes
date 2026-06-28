@@ -1474,17 +1474,43 @@ test('native destructive bridge actions require confirmed payloads', async () =>
   assert.match(swift, /case "delete":\s+guard allowDestructive\(action\) else \{ return \}/);
 });
 
-test('native window drag strip uses local hit testing and performDrag', async () => {
+test('native window drag strip spans full header band and honors web-reported control rects', async () => {
   const swift = await readFile(join(repoRoot, 'Sources', 'HasnaNotesApp', 'main.swift'), 'utf8');
   const dragClass = swift.match(/final class WindowDragStrip: NSView \{[\s\S]*?\n\}/)?.[0] || '';
   assert.match(dragClass, /override var mouseDownCanMoveWindow: Bool \{ true \}/);
   assert.match(dragClass, /override func acceptsFirstMouse\(for event: NSEvent\?\) -> Bool \{ true \}/);
-  assert.match(dragClass, /return bounds\.contains\(point\) \? self : nil/);
+  // The strip drags everywhere inside its bounds EXCEPT over the interactive controls
+  // the web layer reports (minimize / compact), which fall through to the WKWebView.
+  assert.match(dragClass, /var passthroughRects: \[NSRect\]/);
+  assert.match(dragClass, /guard bounds\.contains\(point\) else \{ return nil \}/);
+  assert.match(dragClass, /for r in passthroughRects where r\.contains\(point\) \{ return nil \}/);
+  // hit testing stays in local coordinates — no re-conversion (the prior double-convert bug).
   assert.doesNotMatch(dragClass, /convert\(point,\s*from:/);
   assert.match(dragClass, /window\?\.performDrag\(with: event\)/);
-  assert.match(swift, /WindowDragStrip\(frame: NSRect\(x: 0, y: frame\.height - 30, width: frame\.width, height: 30\)\)/);
+  // The strip now covers the FULL native header band: 30px traffic-light inset + 30px control row.
+  assert.match(swift, /let headerDragHeight: CGFloat = 60/);
+  assert.match(swift, /WindowDragStrip\(frame: NSRect\(x: 0, y: frame\.height - headerDragHeight, width: frame\.width, height: headerDragHeight\)\)/);
   assert.match(swift, /dragStrip\.identifier = NSUserInterfaceItemIdentifier\("window-drag-strip"\)/);
   assert.match(swift, /dragStrip\.autoresizingMask = \[\.width, \.minYMargin\]/);
+  // Background dragging stays as a fallback.
+  assert.match(swift, /window\.isMovableByWindowBackground = true/);
+});
+
+test('header drag-exclusion bridge: web reports control rects, native applies them', async () => {
+  const swift = await readFile(join(repoRoot, 'Sources', 'HasnaNotesApp', 'main.swift'), 'utf8');
+  const app = await readFile(join(repoRoot, 'web', 'app.js'), 'utf8');
+  const html = await readFile(join(repoRoot, 'web', 'index.html'), 'utf8');
+  // Web posts the interactive control rects over the `window` channel.
+  assert.match(app, /postWindow\('dragExclusions', \{ rects: rects \}\)/);
+  assert.match(app, /data-no-drag/);
+  assert.match(app, /getBoundingClientRect\(\)/);
+  // Native window handler consumes them and converts CSS px -> strip-local coords.
+  assert.match(swift, /action == "dragExclusions"/);
+  assert.match(swift, /func applyDragExclusions/);
+  assert.match(swift, /passthroughRects = /);
+  // The minimize + compact controls are explicitly flagged no-drag in the markup.
+  const noDragCount = (html.match(/data-no-drag/g) || []).length;
+  assert.ok(noDragCount >= 2, `expected >=2 data-no-drag controls, found ${noDragCount}`);
 });
 
 test('recording and realtime transcription contracts are exposed to UI/native host', async () => {

@@ -748,6 +748,33 @@
     }
   }
 
+  // The native host overlays a transparent drag strip across the FULL header band so the
+  // window is movable by its header (the WKWebView alone swallows drags). That strip would
+  // also swallow clicks on the header controls — so we report each interactive control's
+  // viewport rect (CSS px, top-left origin) to native, which punches matching pass-through
+  // holes in the strip. Controls opt in with `data-no-drag`. Recomputed on layout changes.
+  function reportDragExclusions() {
+    if (!nativeWindow()) return;
+    try {
+      const rects = [];
+      document.querySelectorAll('[data-no-drag]').forEach((el) => {
+        const r = el.getBoundingClientRect();
+        // Skip controls in the hidden shell (display:none ⇒ zero-size rect).
+        if (r.width <= 0 || r.height <= 0) return;
+        rects.push({ x: r.left, y: r.top, w: r.width, h: r.height });
+      });
+      postWindow('dragExclusions', { rects: rects });
+    } catch (e) { /* host gone — ignore */ }
+  }
+
+  // Coalesce bursts (resize, shell switch, render) into one report per frame.
+  let _dragExclRAF = 0;
+  function scheduleDragExclusions() {
+    if (!nativeWindow()) return;
+    if (_dragExclRAF) return;
+    _dragExclRAF = requestAnimationFrame(() => { _dragExclRAF = 0; reportDragExclusions(); });
+  }
+
   // ------------------------------------------------------------------ toast
   let toastTimer = null;
   function toast(msg) {
@@ -1594,6 +1621,8 @@
       showApp();
       render();
     }
+    // The visible header controls differ per shell — refresh the native drag holes.
+    scheduleDragExclusions();
   }
 
   // Theme: persisted in localStorage, applied as data-theme on <html>. "system"
@@ -2657,6 +2686,10 @@
     document.addEventListener('keydown', onGlobalKeydown);
     document.addEventListener('pointerdown', onGlobalPointerDown, true);
     window.addEventListener('scroll', onWindowScroll, true);
+    // Keep the native drag-strip pass-through holes aligned with the header controls as
+    // the window resizes, and report once now that the header is laid out.
+    window.addEventListener('resize', scheduleDragExclusions);
+    scheduleDragExclusions();
 
     const openSet = $('open-settings'); if (openSet) openSet.addEventListener('click', onOpenSettings);
     const back = $('settings-back'); if (back) back.addEventListener('click', onSettingsBack);

@@ -696,14 +696,23 @@ final class WeakScriptProxy: NSObject, WKScriptMessageHandler {
 /// drag there moves the window like a normal title bar (the traffic-light buttons, which
 /// float above the content, keep working).
 final class WindowDragStrip: NSView {
+    /// Rects — in THIS view's local coordinate space — over which the strip must NOT
+    /// claim the mouse, so the click falls through to the WKWebView below and the web
+    /// control (minimize / compact-expand / compact form) receives it. The web layer
+    /// reports these via the `window` message channel (`dragExclusions`); see
+    /// `AppDelegate.applyDragExclusions`. Empty until the first report arrives.
+    var passthroughRects: [NSRect] = []
+
     override var mouseDownCanMoveWindow: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
-        // AppKit supplies `point` in this view's coordinate space. Keep the
-        // overlay hit-testable only inside its strip, without stealing events
-        // from the web controls below it.
-        return bounds.contains(point) ? self : nil
+        // AppKit supplies `point` in this view's coordinate space (no re-conversion —
+        // a prior double-convert made the whole strip dead). Drag everywhere inside the
+        // strip EXCEPT over the reported interactive controls, which pass through.
+        guard bounds.contains(point) else { return nil }
+        for r in passthroughRects where r.contains(point) { return nil }
+        return self
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -716,6 +725,9 @@ final class WindowDragStrip: NSView {
 final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKScriptMessageHandler, WKUIDelegate {
     var window: NSWindow!
     var web: WKWebView!
+    /// Transparent overlay covering the full native header band; drags the window except
+    /// over web-reported interactive controls. Held so `applyDragExclusions` can update it.
+    private var dragStrip: WindowDragStrip?
     let bridge = NotesBridge()
     let sidecar = AISidecar()
     private let notesHandlerName = "notes"
@@ -826,10 +838,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         container.autoresizingMask = [.width, .height]
         web.frame = container.bounds
         container.addSubview(web)
-        let dragStrip = WindowDragStrip(frame: NSRect(x: 0, y: frame.height - 30, width: frame.width, height: 30))
+        // The native drag band spans the FULL visible header in `body.native` mode: the
+        // 30px traffic-light inset PLUS the 30px control row beneath it (see `--native-inset`
+        // and `.content-header` in web/styles.css). The lower half lives inside the WKWebView,
+        // which swallows drags — so the strip must cover it too. The web layer reports the
+        // rects of the interactive controls in this band (minimize / compact), which the
+        // strip's hitTest lets through; everywhere else drags the window.
+        let headerDragHeight: CGFloat = 60
+        let dragStrip = WindowDragStrip(frame: NSRect(x: 0, y: frame.height - headerDragHeight, width: frame.width, height: headerDragHeight))
         dragStrip.identifier = NSUserInterfaceItemIdentifier("window-drag-strip")
         dragStrip.autoresizingMask = [.width, .minYMargin]
         container.addSubview(dragStrip)
+        self.dragStrip = dragStrip
         window.contentView = container
 
         guard let webDir = Bundle.main.resourceURL?.appendingPathComponent("web", isDirectory: true) else {
@@ -882,6 +902,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             if action == "setCompact" {
                 let on = (payload["on"] as? Bool) ?? false
                 DispatchQueue.main.async { [weak self] in self?.setCompact(on) }
+            } else if action == "dragExclusions" {
+                // The web layer reports the viewport rects (CSS px, top-left origin) of the
+                // header controls that must stay clickable. Convert + apply on the main thread.
+                let rects = (payload["rects"] as? [[String: Any]]) ?? []
+                DispatchQueue.main.async { [weak self] in self?.applyDragExclusions(rects) }
             } else if action == "recording" {
                 // Contract: { action:"recording", state:'started'|'paused'|'resumed'|'stopping'|'transcribing'|'complete'|'error'|'stopped'|'tick', elapsedMs, status }
                 let state = (payload["state"] as? String) ?? "stopped"
@@ -968,6 +993,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
 
     /// Shrink to a small floating quick-note window (on=true) or restore the full window
     /// (on=false). The same app/web view is reused — only the native window changes.
+    /// Convert the web-reported header-control rects (CSS px, viewport top-left origin) into
+    /// the drag strip's local coordinate space (bottom-left origin) and store them as
+    /// passthrough holes. The WKWebView fills the window content and the strip is pinned to
+    /// the top spanning the full width, so a CSS x maps 1:1 to a strip-local x, and a CSS y
+    /// measured from the viewport top maps to `stripHeight - y - height` from the strip bottom.
+    /// Only rects that actually overlap the band are kept.
+    private func applyDragExclusions(_ raw: [[String: Any]]) {
+        guard let strip = dragStrip else { return }
+        let stripH = strip.bounds.height
+        func num(_ v: Any?) -> CGFloat? {
+            if let d = v as? Double { return CGFloat(d) }
+            if let n = v as? NSNumber { return CGFloat(n.doubleValue) }
+            return nil
+        }
+        var rects: [NSRect] = []
+        for r in raw {
+            guard let x = num(r["x"]), let y = num(r["y"]),
+                  let w = num(r["w"]), let h = num(r["h"]),
+                  w > 0, h > 0 else { continue }
+            let rect = NSRect(x: x, y: stripH - y - h, width: w, height: h)
+            if rect.intersects(strip.bounds) { rects.append(rect) }
+        }
+        strip.passthroughRects = rects
+    }
+
     private func setCompact(_ on: Bool) {
         guard let window = window else { return }
         if on {

@@ -354,6 +354,9 @@ do {
         check(machines[0].lastSeenAt != nil && machines[0].syncedAt != nil, "activity timestamps parsed")
         check(machines[1].sshAddress == "m2", "missing sshAddress defaults to id")
         check(machines[1].isMac == false, "linux machine flagged non-mac")
+        check(machines[1].isLinux == true, "linux machine flagged linux")
+        check(machines[1].isSyncEligible == true, "linux machine is sync-eligible")
+        check(machines[0].isSyncEligible == true, "mac machine is sync-eligible")
         check(machines[2].id == "m3" && machines[2].sshAddress == "10.0.0.3", "name/host aliases honored")
         check(FleetManifest.parse(jsonData: Data("{}".utf8)).isEmpty, "empty manifest parses to []")
     }

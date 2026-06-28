@@ -68,6 +68,16 @@ public struct FleetMachine: Identifiable, @unchecked Sendable {
         let p = platform.lowercased()
         return p.contains("mac") || p == "darwin" || p == "osx"
     }
+
+    public var isLinux: Bool {
+        let p = platform.lowercased()
+        return p.contains("linux") || p.contains("ubuntu") || p.contains("debian")
+    }
+
+    /// A machine FleetSync can rsync notes with. Macs and Linux boxes (e.g. the Spark
+    /// servers) both run the same `~/.hasna/apps/notes/notes/` flat-file store over
+    /// `rsync`/`ssh`, so both are eligible; genuinely unknown platforms are excluded.
+    public var isSyncEligible: Bool { isMac || isLinux }
 }
 
 /// Reads the fleet manifest from, in priority order:
@@ -246,11 +256,13 @@ public struct FleetSyncResult: Equatable, Sendable {
     }
 }
 
-/// Bidirectional, newest-wins note synchronization across the macOS fleet over `rsync`/`ssh`.
+/// Bidirectional, newest-wins note synchronization across the fleet (macOS + Linux) over
+/// `rsync`/`ssh`.
 ///
 /// Notes are uuid-named flat files, so a union merge with `rsync -au` (update: only copy
 /// when source is newer) in BOTH directions is a correct merge: every machine ends up with
-/// the newest version of every note. Self and non-mac / unreachable machines are skipped.
+/// the newest version of every note. There is no `--delete`, so a sync never destroys notes
+/// on either side. Self, unsupported-platform, and unreachable machines are skipped.
 public struct FleetSync {
     public let localNotesDir: URL
     public let localMachineID: String
@@ -317,7 +329,8 @@ public struct FleetSync {
         return s.split(separator: ".", maxSplits: 1).first.map(String.init) ?? s
     }
 
-    /// Decide which machines to sync with: mac-only, excluding self.
+    /// Decide which machines to sync with: every sync-eligible machine (Mac OR Linux),
+    /// excluding self and genuinely unknown platforms.
     ///
     /// Self-exclusion is DEFENSIVE: a manifest entry is dropped if its `id` OR the host of
     /// its `sshAddress` matches ANY name that identifies this machine (the explicit
@@ -328,7 +341,7 @@ public struct FleetSync {
     public func syncTargets(from fleet: [FleetMachine]) -> [FleetMachine] {
         let selves = localIdentitySet()
         return fleet.filter { m in
-            guard m.isMac else { return false }
+            guard m.isSyncEligible else { return false }
             if selves.contains(FleetSync.normalizeHost(m.id)) { return false }
             if selves.contains(FleetSync.normalizeHost(m.sshAddress)) { return false }
             return true

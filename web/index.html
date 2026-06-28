@@ -62,7 +62,7 @@
              wordmark lives in the sidebar only (no duplicate here). -->
         <header class="content-header" id="content-header">
           <span class="ch-spacer"></span>
-          <button class="win-min" id="win-min" title="Minimize to quick note"><svg viewBox="0 0 20 20" fill="none"><rect x="4" y="4.5" width="12" height="11" rx="2.2" stroke="currentColor" stroke-width="1.5"/><path d="M7.5 9.5h5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button>
+          <button class="win-min" id="win-min" data-no-drag title="Minimize to quick note"><svg viewBox="0 0 20 20" fill="none"><rect x="4" y="4.5" width="12" height="11" rx="2.2" stroke="currentColor" stroke-width="1.5"/><path d="M7.5 9.5h5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button>
         </header>
 
         <!-- ============ HOME ============ -->
@@ -277,14 +277,14 @@
       <div class="compact-inner">
         <div class="compact-head">
           <span class="compact-title">Quick note</span>
-          <button class="compact-expand" id="compact-expand" title="Expand to full app">
+          <button class="compact-expand" id="compact-expand" data-no-drag title="Expand to full app">
             <svg viewBox="0 0 18 18" fill="none"><path d="M11 3h4v4M7 15H3v-4M15 3l-5 5M3 15l5-5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
             Expand
           </button>
         </div>
         <form class="compact-form" id="compact-form">
-          <input class="compact-input" id="compact-input" type="text" placeholder="Jot a note…" autocomplete="off" spellcheck="false">
-          <button class="compact-add" id="compact-add" type="submit">Add</button>
+          <input class="compact-input" id="compact-input" data-no-drag type="text" placeholder="Jot a note…" autocomplete="off" spellcheck="false">
+          <button class="compact-add" id="compact-add" data-no-drag type="submit">Add</button>
         </form>
       </div>
     </div>

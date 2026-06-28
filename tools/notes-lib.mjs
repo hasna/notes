@@ -79,6 +79,34 @@ function pickTimestamp(entry, keys) {
   return '';
 }
 
+function hasObjectKeys(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length > 0;
+}
+
+function paginationFrom(value, fallback = {}) {
+  const p = objectValue(value);
+  const limit = parsePositiveInt(p.limit, parsePositiveInt(fallback.limit, 10));
+  const offset = Math.max(0, Number(p.offset ?? fallback.offset ?? 0));
+  const total = Math.max(0, Number(p.total ?? fallback.total ?? 0));
+  const count = Math.max(0, Number(p.count ?? fallback.count ?? 0));
+  const nextOffsetRaw = p.nextOffset ?? p.next_offset ?? fallback.nextOffset;
+  const nextOffset = Number.isFinite(Number(nextOffsetRaw)) ? Number(nextOffsetRaw) : offset + count;
+  const hasMore = typeof p.hasMore === 'boolean' ? p.hasMore
+    : typeof p.has_more === 'boolean' ? p.has_more
+      : offset + count < total;
+  return {
+    limit,
+    offset,
+    total,
+    count,
+    hasMore,
+    nextOffset,
+    has_more: hasMore,
+    next_offset: nextOffset,
+    order: p.order || fallback.order || 'updated_at_desc',
+  };
+}
+
 function maxISO(values) {
   let max = '';
   for (const value of values) {
