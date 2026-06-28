@@ -32,6 +32,7 @@ import {
   CHAT_TOOL_SCHEMAS,
   executeNotesAgentTool,
   runNotesAgent,
+  runNotesGoal,
 } from '../tools/notes-agent.mjs';
 
 const tools = [
@@ -272,6 +273,23 @@ const tools = [
         limit: { type: 'number' },
       },
       required: ['prompt'],
+    },
+  },
+  {
+    name: 'agent_goal',
+    description: 'Run a simple Hasna Notes goal loop until done, user input/approval is needed, blocked, or maxSteps is reached.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        objective: { type: 'string' },
+        confirm: { type: 'boolean' },
+        dryRun: { type: 'boolean' },
+        actorName: { type: 'string' },
+        openedFrom: { type: 'string' },
+        sourceContext: { type: 'string' },
+        maxSteps: { type: 'number' },
+      },
+      required: ['objective'],
     },
   },
   {
@@ -546,6 +564,21 @@ async function callTool(name, args) {
       openedFrom: args.openedFrom || 'mcp-agent',
       sourceContext: args.sourceContext || String(args.prompt).slice(0, 200),
       limit: args.limit,
+      onEvent: event => events.push(event),
+    });
+    return textResult({ ...result, events });
+  }
+  if (name === 'agent_goal') {
+    const events = [];
+    const result = await runNotesGoal(requireArg(args, 'objective'), {
+      confirmWrites: !!args.confirm,
+      yes: !!args.confirm,
+      dryRun: !!args.dryRun,
+      actorName: args.actorName || process.env.HASNA_NOTES_ACTOR_NAME || 'MCP Agent',
+      actorType: 'agent',
+      openedFrom: args.openedFrom || 'mcp-agent-goal',
+      sourceContext: args.sourceContext || String(args.objective).slice(0, 200),
+      maxSteps: args.maxSteps,
       onEvent: event => events.push(event),
     });
     return textResult({ ...result, events });

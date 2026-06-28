@@ -27,7 +27,7 @@ import Foundation
 ///   - finds a `node` binary,
 ///   - picks a free loopback TCP port,
 ///   - reads the OpenAI key from `~/.secrets/hasnaxyz/openai/live.env` (or `OPENAI_API_KEY`),
-///   - launches the child with `OPENAI_API_KEY` + `PORT` in its environment,
+///   - launches the child with `OPENAI_API_KEY`, `PORT`, and a per-run sidecar token,
 ///   - pipes child stdout/stderr to `NSLog` (prefix `Sidecar:`).
 ///
 /// If node or the key is missing it simply doesn't spawn; `available` stays false and the
@@ -38,6 +38,7 @@ final class AISidecar {
     private(set) var available: Bool = false
     private(set) var realtimeAvailable: Bool = false
     private(set) var realtimeProvider: String = "openai"
+    private(set) var token: String = UUID().uuidString + "-" + UUID().uuidString
     private var process: Process?
 
     /// Durable log file for sidecar output (port, request errors). NSLog visibility in the
@@ -190,6 +191,7 @@ final class AISidecar {
         if let openAIKey { env["OPENAI_API_KEY"] = openAIKey }
         if let elevenLabsKey { env["ELEVENLABS_API_KEY"] = elevenLabsKey }
         env["PORT"] = String(chosen)
+        env["HASNA_NOTES_SIDECAR_TOKEN"] = token
         proc.environment = env
         let requestedProvider = (env["HASNA_NOTES_TRANSCRIPTION_PROVIDER"] ?? "").lowercased()
         let chosenRealtimeProvider: String
@@ -391,10 +393,12 @@ private func machineJSON(_ machine: FleetMachine, notes: [Note], fallbackID: Str
 /// stays clean.
 final class NotesBridge {
     let store = MarkdownStore()
+    let labelStore: LabelStore
     let settingsStore: SettingsStore
     let thisMachine: String
 
     init() {
+        self.labelStore = LabelStore(root: store.rootURL)
         self.settingsStore = SettingsStore(root: store.rootURL)
         // The note's own `machine` field uses the cosmetic Computer Name; the BOOT
         // payload's `thisMachine` must match that so new notes land under the right
@@ -467,6 +471,7 @@ final class NotesBridge {
         let payload: [String: Any] = [
             "notes": notes.map(noteJSON),
             "machines": machinePayloads(notes: notes),
+            "labels": labelStore.load(),
             "thisMachine": thisMachine,
             "settings": ["trashRetentionDays": settingsStore.load().trashRetentionDays],
             "listDefaults": ["limit": 10],
@@ -654,6 +659,13 @@ final class NotesBridge {
         do { try settingsStore.save(NotesSettings(trashRetentionDays: days)); return true }
         catch { NSLog("HasnaNotes: settings save failed: \(error.localizedDescription)"); return false }
     }
+
+    @discardableResult
+    func updateLabels(_ dict: [String: Any]) -> Bool {
+        let labels = (dict["labels"] as? [String]) ?? (dict["tags"] as? [String]) ?? []
+        do { try labelStore.save(labels); return true }
+        catch { NSLog("HasnaNotes: labels save failed: \(error.localizedDescription)"); return false }
+    }
 }
 
 // MARK: - Weak message-handler proxy (leak-safety)
@@ -788,6 +800,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             "running": sidecar.running,
             "realtime": sidecar.realtimeAvailable,
             "realtimeProvider": sidecar.realtimeProvider,
+            "token": sidecar.token,
         ]
         let aiJS = "window.__AI__ = \(jsonString(aiPayload));"
         cfg.userContentController.addUserScript(
@@ -935,6 +948,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             guard allowDestructive(action) else { return }
             changed = bridge.purge(noteDict)
         case "settings": changed = bridge.updateSettings(noteDict)
+        case "labels": changed = bridge.updateLabels(noteDict)
         case "delete":
             guard allowDestructive(action) else { return }
             changed = bridge.delete(noteDict)

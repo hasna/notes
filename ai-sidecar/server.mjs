@@ -11,7 +11,8 @@
 //   WS   /realtime-transcribe
 //                      — normalized streaming transcript events from OpenAI Realtime
 //                        or optional ElevenLabs Scribe v2 Realtime
-//   POST /chat        — AI SDK streamText/tool-call chat over a supplied notes snapshot
+//   POST /chat        — AI SDK ToolLoopAgent/tool-call chat over shared notes tools
+//   POST /tool        — explicit user-approved execution for confirmation-gated tools
 //   GET  /health      — liveness probe
 //
 // Configuration is entirely via env, provided by the host:
@@ -22,14 +23,21 @@
 // local file:// page talking to 127.0.0.1; the server binds to loopback so nothing
 // off-box can reach it. The API key is never written to stdout/stderr.
 import http from 'node:http';
+import crypto from 'node:crypto';
 import { WebSocket, WebSocketServer } from 'ws';
-import { generateText, experimental_transcribe as transcribe, jsonSchema, stepCountIs, streamText, tool } from 'ai';
+import { generateText, experimental_transcribe as transcribe, jsonSchema, stepCountIs, ToolLoopAgent, streamText, tool } from 'ai';
 import { createOpenAI } from '@ai-sdk/openai';
+import {
+  CHAT_TOOL_SCHEMAS,
+  executeNotesAgentTool,
+  parseGoalCommand,
+} from '../tools/notes-agent.mjs';
 
 const PORT = Number(process.env.PORT || 8765);
 const HOST = '127.0.0.1';
 const API_KEY = process.env.OPENAI_API_KEY || '';
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || '';
+const SIDECAR_TOKEN = process.env.HASNA_NOTES_SIDECAR_TOKEN || crypto.randomBytes(32).toString('hex');
 
 // Provider instance bound to the host-supplied key. Created up front so a missing key
 // surfaces as a clean 500 from the request handler rather than a crash on boot.
@@ -95,13 +103,14 @@ const OPENAI_REALTIME_TRANSCRIPTION_MODEL = normalizeRealtimeTranscriptionModel(
 );
 const ELEVENLABS_REALTIME_MODEL = process.env.HASNA_NOTES_ELEVENLABS_REALTIME_MODEL || 'scribe_v2_realtime';
 const DEFAULT_REALTIME_PROVIDER = (process.env.HASNA_NOTES_TRANSCRIPTION_PROVIDER || 'openai').toLowerCase();
+const pendingApprovals = new Map();
 
 // ------------------------------------------------------------------ helpers
 
 // Apply the loopback-CORS headers to every response (incl. errors and preflight).
 function cors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Hasna-Notes-Token, Authorization');
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
 }
 
@@ -109,6 +118,69 @@ function sendJSON(res, status, obj) {
   cors(res);
   res.writeHead(status, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(obj));
+}
+
+function safeTokenEqual(value) {
+  const given = Buffer.from(String(value || ''), 'utf8');
+  const expected = Buffer.from(SIDECAR_TOKEN, 'utf8');
+  return given.length === expected.length && crypto.timingSafeEqual(given, expected);
+}
+
+function tokenFromRequest(req, urlObj) {
+  const header = req.headers['x-hasna-notes-token'];
+  if (typeof header === 'string' && header) return header;
+  const auth = req.headers.authorization || '';
+  const bearer = /^Bearer\s+(.+)$/i.exec(auth);
+  if (bearer) return bearer[1];
+  return urlObj?.searchParams?.get('token') || '';
+}
+
+function requireSidecarAuth(req, res, urlObj) {
+  if (safeTokenEqual(tokenFromRequest(req, urlObj))) return true;
+  sendJSON(res, 401, { error: 'unauthorized' });
+  return false;
+}
+
+function stableJSON(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJSON).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableJSON(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function comparableToolInput(input) {
+  const copy = { ...(input || {}) };
+  delete copy.confirm;
+  delete copy.approvalId;
+  return copy;
+}
+
+function toolRequiresConfirmation(name) {
+  return !!CHAT_TOOL_SCHEMAS.find(schema => schema.name === name)?.safety?.requiresConfirmation;
+}
+
+function rememberApproval(result) {
+  const approval = result?.approval;
+  if (!result?.requiresConfirmation || !approval?.id) return;
+  pendingApprovals.set(approval.id, {
+    toolName: approval.toolName,
+    input: comparableToolInput(approval.input || {}),
+    expiresAt: Date.now() + 10 * 60 * 1000,
+  });
+}
+
+function consumeApproval(approvalId, toolName, input) {
+  if (!approvalId) return { ok: false, error: 'approval_id_required' };
+  const approval = pendingApprovals.get(approvalId);
+  if (!approval) return { ok: false, error: 'approval_not_found' };
+  pendingApprovals.delete(approvalId);
+  if (approval.expiresAt < Date.now()) return { ok: false, error: 'approval_expired' };
+  if (approval.toolName !== toolName) return { ok: false, error: 'approval_tool_mismatch' };
+  if (stableJSON(approval.input) !== stableJSON(comparableToolInput(input))) {
+    return { ok: false, error: 'approval_input_mismatch' };
+  }
+  return { ok: true };
 }
 
 // Read and JSON-parse a request body, capped so a runaway upload can't exhaust memory.
@@ -145,6 +217,60 @@ function cleanTitle(s) {
   if (words.length > 4) t = words.slice(0, 4).join(' ');
   if (/^(untitled|new note|note|summary)$/i.test(t)) return '';
   return t;
+}
+
+// ------------------------------------------------------------------ shared agent tools
+
+function noteAgentTools(context = {}) {
+  const tools = {};
+  for (const schema of CHAT_TOOL_SCHEMAS) {
+    tools[schema.name] = tool({
+      description: `${schema.description} Safety: ${schema.safety.readOnly ? 'read-only' : 'mutates notes'}` +
+        `${schema.safety.requiresConfirmation ? '; requires explicit user confirmation before applying.' : '.'}`,
+      inputSchema: jsonSchema(schema.inputSchema),
+      execute: async (input = {}) => {
+        const safeInput = { ...input };
+        // Model-originated destructive confirmations are never trusted. The UI must call
+        // /tool with confirm:true after the user approves the preview.
+        delete safeInput.confirm;
+        const result = await executeNotesAgentTool(schema.name, safeInput, {
+          ...context,
+          actorType: 'agent',
+          actorName: context.actorName || process.env.HASNA_NOTES_ACTOR_NAME || 'Hasna Notes Chat',
+          openedFrom: context.openedFrom || 'sidecar-chat',
+          sourceContext: context.sourceContext || 'ai-sdk-chat',
+          confirmWrites: false,
+        });
+        rememberApproval(result);
+        return result;
+      },
+    });
+  }
+  return tools;
+}
+
+function modelMessages(messages) {
+  if (!Array.isArray(messages)) return null;
+  return messages.map(message => {
+    const role = ['user', 'assistant', 'system'].includes(message?.role) ? message.role : 'user';
+    const content = Array.isArray(message?.parts)
+      ? message.parts.filter(part => part?.type === 'text').map(part => part.text || '').join('\n')
+      : String(message?.content || message?.text || '');
+    return { role, content };
+  }).filter(message => message.content.trim());
+}
+
+function terminalGoalStatus(text, pendingConfirmation) {
+  if (pendingConfirmation) return 'needs_input';
+  const value = String(text || '').toLowerCase();
+  const explicit = /goal status:\s*(done|needs[_ -]?input|blocked)/i.exec(String(text || ''));
+  if (explicit) {
+    const status = explicit[1].toLowerCase().replace(/[- ]/g, '_');
+    return status === 'needs_input' ? 'needs_input' : status;
+  }
+  if (/\b(needs? (user )?input|need you to|please provide|which note|what label|what machine|which machine)\b/.test(value)) return 'needs_input';
+  if (/\b(blocked|cannot continue|not possible|unable to proceed)\b/.test(value)) return 'blocked';
+  return 'blocked';
 }
 
 // ------------------------------------------------------------------ handlers
@@ -338,37 +464,130 @@ async function handleChat(req, res) {
   catch (e) { return sendJSON(res, 400, { error: String(e.message || e) }); }
 
   const notes = notesFromBody(body);
-  const prompt = String(body.prompt || body.message || '').trim();
-  const messages = Array.isArray(body.messages) ? body.messages : null;
-  if (!prompt && !messages) return sendJSON(res, 400, { error: 'empty_prompt' });
+  const rawPrompt = String(body.prompt || body.message || '').trim();
+  const goalObjective = String(body.goal?.objective || '').trim() || parseGoalCommand(rawPrompt);
+  const prompt = goalObjective || rawPrompt;
+  const messages = modelMessages(body.messages);
+  if (!prompt && !(messages && messages.length)) return sendJSON(res, 400, { error: 'empty_prompt' });
 
   cors(res);
   res.writeHead(200, { 'Content-Type': 'application/x-ndjson; charset=utf-8' });
   const writeEvent = event => res.write(JSON.stringify(event) + '\n');
-  writeEvent({ type: 'ready', provider: 'openai', model: CHAT_MODEL });
+  const maxSteps = Number(body.maxSteps || (goalObjective ? 10 : 8));
+  const goal = goalObjective ? {
+    id: `goal-${Date.now()}`,
+    objective: goalObjective,
+    status: 'running',
+    maxSteps,
+    steps: [],
+  } : null;
+  writeEvent({ type: 'ready', provider: 'openai', model: CHAT_MODEL, mode: goal ? 'goal' : 'chat' });
+  if (goal) writeEvent({ type: 'goal-state', goal });
 
   try {
-    const result = streamText({
+    const selectedNote = body.selectedNoteId ? `\nSelected note id: ${String(body.selectedNoteId)}` : '';
+    const labelContext = Array.isArray(body.labels) && body.labels.length ? `\nKnown labels: ${body.labels.map(String).join(', ')}` : '';
+    const goalInstructions = goal
+      ? [
+          '',
+          'Goal mode:',
+          '- Keep using tools until the objective is achieved, explicit user input is required, a confirmation-gated tool returns an approval preview, a clear blocker appears, or the max-step guard stops the run.',
+          '- Do not stop after a single general answer when the goal requires note inspection or note/label operations.',
+          '- End with one of: Goal status: done, Goal status: needs_input, or Goal status: blocked.',
+        ].join('\n')
+      : '';
+    const instructions =
+      'You are Hasna Notes Chat, an agentic local notes assistant. Coordinate internally as Planner, Notes Operator, Label Curator, and Safety Reviewer. ' +
+      'Use tools for note facts and cite note titles/ids. Prefer narrow, reversible operations. Destructive, broad, or cross-machine changes must stay as approval previews unless the host later confirms them. ' +
+      'Never claim a write happened when a tool returned requiresConfirmation/dryRun.' +
+      selectedNote + labelContext + goalInstructions;
+    const agent = new ToolLoopAgent({
       model: openai(CHAT_MODEL),
-      system: 'You are Hasna Notes Chat. Use tools to inspect notes before answering. Cite sources by note title/id. Destructive or broad writes must be described as previews only; never claim you wrote unless the host confirms through its own tools.',
-      ...(messages ? { messages } : { prompt }),
-      tools: snapshotTools(notes),
-      stopWhen: stepCountIs(Number(body.maxSteps || 8)),
+      instructions,
+      tools: body.snapshotOnly ? snapshotTools(notes) : noteAgentTools({
+        actorName: body.actorName,
+        openedFrom: goal ? 'sidecar-goal' : 'sidecar-chat',
+        sourceContext: goal ? goalObjective : rawPrompt.slice(0, 300),
+      }),
+      stopWhen: stepCountIs(maxSteps),
       temperature: 0.2,
     });
+    const result = await agent.stream(messages ? { messages } : { prompt });
+    const pendingConfirmations = [];
+    let finalText = '';
+    let goalStep = 0;
     for await (const part of result.fullStream) {
-      if (part.type === 'text-delta') writeEvent({ type: 'text-delta', text: part.text || part.delta || '' });
-      else if (part.type === 'tool-call') writeEvent({ type: 'tool-call', toolCallId: part.toolCallId, toolName: part.toolName, input: part.input });
-      else if (part.type === 'tool-result') writeEvent({ type: 'tool-result', toolCallId: part.toolCallId, toolName: part.toolName, output: part.output });
+      if (part.type === 'text-delta') {
+        const text = part.text || part.delta || '';
+        finalText += text;
+        writeEvent({ type: 'text-delta', text });
+      } else if (part.type === 'tool-call') {
+        goalStep += 1;
+        const toolCall = { id: part.toolCallId, name: part.toolName, input: part.input, state: 'call' };
+        if (goal) {
+          const step = { stepNumber: goalStep, status: 'running', toolCall };
+          goal.steps.push(step);
+          writeEvent({ type: 'goal-step', goalId: goal.id, ...step });
+        }
+        writeEvent({ type: 'tool-call', toolCallId: part.toolCallId, toolName: part.toolName, input: part.input, toolCall });
+      } else if (part.type === 'tool-result') {
+        if (part.output?.requiresConfirmation && part.output?.approval) {
+          rememberApproval(part.output);
+          pendingConfirmations.push(part.output.approval);
+          writeEvent({ type: 'confirmation', approval: part.output.approval });
+          if (goal) {
+            goal.status = 'needs_input';
+            goal.needsInput = 'A tool call requires approval before the goal can continue.';
+            goal.pendingConfirmations = pendingConfirmations;
+            writeEvent({ type: 'goal-state', goal });
+          }
+        }
+        writeEvent({ type: 'tool-result', toolCallId: part.toolCallId, toolName: part.toolName, output: part.output });
+      }
       else if (part.type === 'error') writeEvent({ type: 'error', error: part.error?.message || String(part.error || 'chat_error') });
     }
-    const text = await result.text.catch(() => '');
-    writeEvent({ type: 'finish', text });
+    const text = (await result.text.catch(() => '')) || finalText;
+    if (goal && goal.status === 'running') {
+      goal.status = terminalGoalStatus(text, pendingConfirmations.length > 0);
+      if (goal.status === 'blocked') goal.blocker = text;
+      if (goal.status === 'needs_input') goal.needsInput = text;
+      writeEvent({ type: 'goal-state', goal });
+    }
+    writeEvent({ type: 'finish', text, pendingConfirmations, goal });
     res.end();
   } catch (e) {
     console.error('Sidecar: /chat failed:', e && e.message ? e.message : e);
     writeEvent({ type: 'error', error: 'chat_failed' });
     res.end();
+  }
+}
+
+async function handleTool(req, res) {
+  let body;
+  try { body = await readJSON(req); }
+  catch (e) { return sendJSON(res, 400, { error: String(e.message || e) }); }
+
+  const name = String(body.name || body.toolName || '').trim();
+  if (!name) return sendJSON(res, 400, { error: 'tool_name_required' });
+  const input = body.input || {};
+  if (body.confirm && toolRequiresConfirmation(name)) {
+    const approvalId = body.approvalId || body.approval?.id || input.approvalId || '';
+    const approval = consumeApproval(approvalId, name, input);
+    if (!approval.ok) return sendJSON(res, 409, { error: approval.error });
+  }
+  try {
+    const result = await executeNotesAgentTool(name, input, {
+      actorType: 'agent',
+      actorName: body.actorName || process.env.HASNA_NOTES_ACTOR_NAME || 'Hasna Notes Chat',
+      openedFrom: body.openedFrom || 'sidecar-chat-approval',
+      sourceContext: body.sourceContext || name,
+      dryRun: !!body.dryRun,
+      confirmWrites: !!body.confirm,
+    });
+    rememberApproval(result);
+    return sendJSON(res, 200, result);
+  } catch (e) {
+    return sendJSON(res, 400, { error: e.message || String(e) });
   }
 }
 
@@ -507,7 +726,8 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  const url = (req.url || '').split('?')[0];
+  const urlObj = new URL(req.url || '/', `http://${HOST}:${PORT}`);
+  const url = urlObj.pathname;
 
   if (req.method === 'GET' && url === '/health') {
     return sendJSON(res, 200, {
@@ -529,13 +749,20 @@ const server = http.createServer((req, res) => {
     });
   }
   if (req.method === 'POST' && url === '/title') {
+    if (!requireSidecarAuth(req, res, urlObj)) return;
     return handleTitle(req, res);
   }
   if (req.method === 'POST' && url === '/transcribe') {
+    if (!requireSidecarAuth(req, res, urlObj)) return;
     return handleTranscribe(req, res);
   }
   if (req.method === 'POST' && url === '/chat') {
+    if (!requireSidecarAuth(req, res, urlObj)) return;
     return handleChat(req, res);
+  }
+  if (req.method === 'POST' && url === '/tool') {
+    if (!requireSidecarAuth(req, res, urlObj)) return;
+    return handleTool(req, res);
   }
 
   sendJSON(res, 404, { error: 'not_found' });
@@ -546,6 +773,11 @@ const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url || '/', `http://${HOST}:${PORT}`);
   if (url.pathname !== '/realtime-transcribe') {
+    socket.destroy();
+    return;
+  }
+  if (!safeTokenEqual(tokenFromRequest(req, url))) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
     socket.destroy();
     return;
   }
