@@ -250,6 +250,7 @@ const tools = [
         apply: { type: 'boolean', default: false },
         force: { type: 'boolean', default: false },
         sidecar: { type: 'string' },
+        sidecarToken: { type: 'string' },
       },
     },
   },
@@ -538,7 +539,7 @@ async function callTool(name, args) {
     const note = args.id ? await getNote(args.id) : null;
     if (args.id && !note) throw new Error('note_not_found');
     const text = String(args.text ?? note?.body ?? '');
-    const result = await generateTitle(text, { sidecar: args.sidecar });
+    const result = await generateTitle(text, { sidecar: args.sidecar, sidecarToken: args.sidecarToken });
     const fingerprint = contentFingerprint(markdownPlainText(text));
     if (args.apply) {
       if (!note) throw new Error('id_required_for_apply');
