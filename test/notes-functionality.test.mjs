@@ -281,7 +281,7 @@ function openFakeTitleServer(title, seen = []) {
       let body = '';
       req.on('data', chunk => { body += chunk; });
       req.on('end', () => {
-        try { seen.push(JSON.parse(body)); } catch { seen.push({}); }
+        try { seen.push({ ...JSON.parse(body), headers: req.headers }); } catch { seen.push({ headers: req.headers }); }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ title }));
       });
@@ -732,7 +732,7 @@ test('web chat bridge emits tool source and confirmation events', async () => {
       { id: 'chat-1', title: 'Alpha Plan', body: 'Alpha launch plan and budget.', labels: ['alpha'], status: 'active', machine: 'apple03', updatedAt: '2026-06-23T10:00:00Z', createdAt: '2026-06-23T09:00:00Z' },
       { id: 'chat-2', title: 'Alpha Followup', body: 'Alpha follow-up checklist.', labels: ['alpha'], status: 'active', machine: 'apple03', updatedAt: '2026-06-22T10:00:00Z', createdAt: '2026-06-22T09:00:00Z' },
     ],
-    machines: [{ id: 'apple03' }],
+    machines: [{ id: 'apple03' }, { id: 'apple04', friendlyName: 'Apple 04' }],
   });
 
   const summary = await windowTarget.HasnaNotes.chat.send('summarize alpha notes');
@@ -746,6 +746,26 @@ test('web chat bridge emits tool source and confirmation events', async () => {
   const labelSearch = await windowTarget.HasnaNotes.chat.send('search focus');
   assert.equal(labelSearch.sources[0].id, 'chat-1');
 
+  const listedLabels = await windowTarget.HasnaNotes.chat.send('list labels');
+  assert.equal(listedLabels.toolCalls[0].name, 'list_labels');
+  assert.match(listedLabels.text, /alpha/);
+
+  const createdLabel = await windowTarget.HasnaNotes.chat.send('create label roadmap');
+  assert.equal(createdLabel.toolCalls[0].name, 'create_label');
+  assert.ok(windowTarget.HasnaNotes.labels.list().some(item => item.name === 'roadmap' && item.count === 0));
+
+  const renameLabel = await windowTarget.HasnaNotes.chat.send('rename label roadmap to strategy');
+  assert.equal(renameLabel.toolCalls[0].name, 'update_label');
+  assert.equal(renameLabel.pendingConfirmations.length, 1);
+  const renamedLabel = windowTarget.HasnaNotes.chat.approve(renameLabel.pendingConfirmations[0].id, true);
+  assert.ok(renamedLabel.labels.includes('strategy'));
+
+  const deleteLabel = await windowTarget.HasnaNotes.chat.send('delete label strategy');
+  assert.equal(deleteLabel.toolCalls[0].name, 'delete_label');
+  assert.equal(deleteLabel.pendingConfirmations.length, 1);
+  const deletedLabel = windowTarget.HasnaNotes.chat.approve(deleteLabel.pendingConfirmations[0].id, true);
+  assert.equal(deletedLabel.labels.includes('strategy'), false);
+
   const update = await windowTarget.HasnaNotes.chat.send('update body: Rewritten alpha plan', { noteId: 'chat-1' });
   assert.equal(update.pendingConfirmations.length, 1);
   assert.equal(windowTarget.HasnaNotes.chat.state().toolCalls[0].state, 'approval-requested');
@@ -754,6 +774,13 @@ test('web chat bridge emits tool source and confirmation events', async () => {
   assert.equal(windowTarget.HasnaNotes.chat.state().toolCalls[0].state, 'result');
   const readUpdated = await windowTarget.HasnaNotes.chat.send('read note', { noteId: 'chat-1' });
   assert.match(readUpdated.text, /Rewritten alpha plan/);
+
+  const movePreview = await windowTarget.HasnaNotes.chat.send('move to apple04', { noteId: 'chat-1' });
+  assert.equal(movePreview.toolCalls[0].name, 'move_note');
+  assert.equal(movePreview.pendingConfirmations.length, 1);
+  const moved = windowTarget.HasnaNotes.chat.approve(movePreview.pendingConfirmations[0].id, true);
+  assert.equal(moved.note.id, 'chat-1');
+  assert.equal(windowTarget.HasnaNotes.notes.info('chat-1').currentMachine, 'apple04');
 
   const consolidation = await windowTarget.HasnaNotes.chat.send('consolidate alpha notes');
   assert.equal(consolidation.pendingConfirmations.length, 1);
@@ -773,7 +800,7 @@ test('web navigation exposes Chat below New Note and Labels page operations', as
   assert.match(html, /id="chat-page"/);
   assert.match(html, /id="labels-page-main"/);
 
-  const { windowTarget } = loadWebAppWithFakeDOM(app);
+  const { windowTarget, document } = loadWebAppWithFakeDOM(app);
   windowTarget.HasnaNotes.hydrate({
     thisMachine: 'apple03',
     labels: ['empty'],
@@ -791,6 +818,27 @@ test('web navigation exposes Chat below New Note and Labels page operations', as
   assert.ok(windowTarget.HasnaNotes.labels.list().some(item => item.name === 'project' && item.count === 1));
   windowTarget.HasnaNotes.labels.delete('project', true);
   assert.equal(windowTarget.HasnaNotes.labels.list().some(item => item.name === 'project'), false);
+
+  const toolNames = windowTarget.HasnaNotes.chat.tools().map(tool => tool.name);
+  for (const name of ['move_note', 'list_labels', 'create_label', 'update_label', 'delete_label']) {
+    assert.ok(toolNames.includes(name), `${name} missing from web chat tools`);
+  }
+
+  windowTarget.HasnaNotes.hydrate({
+    thisMachine: 'apple03',
+    labels: [],
+    notes: [
+      { id: 'labels-1', title: 'Work Note', body: 'Work body', labels: ['work'], status: 'active', machine: 'apple03', updatedAt: '2026-06-23T10:00:00Z', createdAt: '2026-06-23T09:00:00Z' },
+      { id: 'labels-2', title: 'Personal Note', body: 'Personal body', labels: ['personal'], status: 'active', machine: 'apple03', updatedAt: '2026-06-22T10:00:00Z', createdAt: '2026-06-22T09:00:00Z' },
+    ],
+    machines: [{ id: 'apple03' }],
+  });
+  windowTarget.HasnaNotes.labels.select('work', { fullPage: true });
+  assert.equal(windowTarget.HasnaNotes.view.state().labelFilter, 'work');
+  const renderedNoteIds = document.getElementById('np-list').children
+    .filter(row => row.dataset && row.dataset.id)
+    .map(row => row.dataset.id);
+  assert.deepEqual(renderedNoteIds, ['labels-1']);
 });
 
 test('web chat slash goal keeps visible goal state in local fallback', async () => {
@@ -1314,6 +1362,18 @@ test('MCP server exposes notes and labels tools over stdio framing', async (t) =
   assert.equal(generated.applied, true);
   assert.ok(generated.title.split(/\s+/).length <= 4);
 
+  const titleHeaders = [];
+  const fakeTitle = await openFakeTitleServer('MCP Token Title', titleHeaders);
+  t.after(fakeTitle.close);
+  const sidecarTitle = await client.send(26, 'tools/call', {
+    name: 'title_generate',
+    arguments: { text: '# MCP sidecar title', sidecar: fakeTitle.url, sidecarToken: 'mcp-sidecar-token' },
+  });
+  const sidecarGenerated = parseToolText(sidecarTitle);
+  assert.equal(sidecarGenerated.provider, 'sidecar');
+  assert.equal(sidecarGenerated.title, 'MCP Token Title');
+  assert.equal(titleHeaders[0].headers['x-hasna-notes-token'], 'mcp-sidecar-token');
+
   const moved = await client.send(6, 'tools/call', {
     name: 'notes_move_to_machine',
     arguments: { id: note.id, machine: 'apple04' },
@@ -1566,6 +1626,12 @@ test('recording and realtime transcription contracts are exposed to UI/native ho
   assert.match(app, /id="nav-chat"|nav-chat/);
   assert.match(app, /sendSidecarChat/);
   assert.match(app, /X-Hasna-Notes-Token/);
+  assert.match(app, /chatTool\('move_note'/);
+  assert.match(app, /chatTool\('list_labels'/);
+  assert.match(app, /chatTool\('create_label'/);
+  assert.match(app, /chatTool\('update_label'/);
+  assert.match(app, /chatTool\('delete_label'/);
+  assert.match(app, /const list = visibleNotes\(\);/);
   assert.match(swift, /HASNA_NOTES_SIDECAR_TOKEN/);
   assert.match(swift, /"token": sidecar\.token/);
 

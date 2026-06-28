@@ -262,6 +262,11 @@
     chatTool('archive_note', 'Archive one note.', false, true),
     chatTool('trash_note', 'Move one note to Trash.', false, true),
     chatTool('restore_note', 'Restore one note.', false, true),
+    chatTool('move_note', 'Move one note to another machine.', false, true),
+    chatTool('list_labels', 'List known labels.', true, false),
+    chatTool('create_label', 'Create an empty label.', false, false),
+    chatTool('update_label', 'Rename a label everywhere.', false, true),
+    chatTool('delete_label', 'Delete a label and remove it from notes.', false, true),
     chatTool('summarize_notes', 'Summarize selected, searched, or all visible notes.', true, false),
     chatTool('find_related_notes', 'Find notes related to a note id or query.', true, false),
     chatTool('consolidate_notes', 'Preview or create a larger consolidated note from several notes.', false, true),
@@ -825,6 +830,20 @@
     labels.forEach(l => host.appendChild(labelRow(l.name, l.name, l.count)));
   }
 
+  function selectLabel(id, options) {
+    const opts = options || {};
+    state.labelFilter = id || ALL;
+    state.noteListLimit = 10;
+    const sel = noteById(state.selectedId);
+    if (sel && state.labelFilter !== ALL && noteLabels(sel).indexOf(state.labelFilter) < 0) {
+      const v = visibleNotes();
+      state.selectedId = v.length ? v[0].id : null;
+    }
+    if (opts.fullPage) showNotesPage();
+    else render();
+    return viewSnapshot();
+  }
+
   function labelRow(id, label, count) {
     const row = el('div', 'label-row');
     row.dataset.label = id;
@@ -840,15 +859,7 @@
     row.appendChild(left);
     row.appendChild(el('span', 'lr-count', String(count)));
     row.addEventListener('click', () => {
-      state.labelFilter = id;
-      state.noteListLimit = 10;
-      // If the open note is filtered out, drop selection to newest visible.
-      const sel = noteById(state.selectedId);
-      if (sel && state.labelFilter !== ALL && noteLabels(sel).indexOf(state.labelFilter) < 0) {
-        const v = visibleNotes();
-        state.selectedId = v.length ? v[0].id : null;
-      }
-      render();
+      selectLabel(id);
     });
     return row;
   }
@@ -1002,7 +1013,7 @@
     const emptyEl = $('np-empty');
     if (!host) return;
     host.innerHTML = '';
-    const list = sortNotes(state.notes.filter(n => n.status !== 'trash' && n.status !== 'archived'));
+    const list = visibleNotes();
     if (countEl) countEl.textContent = list.length === 1 ? '1 note' : list.length + ' notes';
     if (emptyEl) emptyEl.hidden = list.length !== 0;
     list.forEach(n => {
@@ -1126,8 +1137,7 @@
       left.appendChild(el('span', 'lp-name', item.name));
       left.appendChild(el('span', 'lp-count', item.count === 1 ? '1 note' : item.count + ' notes'));
       left.addEventListener('click', () => {
-        state.labelFilter = item.name;
-        showNotesPage();
+        selectLabel(item.name, { fullPage: true });
       });
       row.appendChild(left);
       const actions = el('div', 'lp-actions');
@@ -2947,6 +2957,21 @@
     return m ? chatStripValue(m[1]) : '';
   }
 
+  function chatExtractLabelRename(prompt, opts) {
+    const text = String(prompt || '');
+    const match = /(?:rename|update)\s+label\s+["“]?([^"”]+?)["”]?\s+(?:to|as)\s+["“]?([^"”]+)["”]?$/i.exec(text);
+    return {
+      oldName: (opts && opts.oldName) || (match && match[1] && match[1].trim()) || '',
+      newName: (opts && opts.newName) || (match && match[2] && match[2].trim()) || '',
+    };
+  }
+
+  function chatExtractMachine(prompt, opts) {
+    if (opts && (opts.machine || opts.targetMachine)) return String(opts.machine || opts.targetMachine).trim();
+    const match = /\b(?:to|machine)\s+([A-Za-z0-9._-]+)\b/i.exec(String(prompt || ''));
+    return match ? match[1].trim() : '';
+  }
+
   function chatExtractUpdate(prompt, opts) {
     const text = String(prompt || '');
     const title = opts && opts.title != null ? opts.title : /(?:^|\b)title\s*[:=]\s*([^\n]+)/i.exec(text)?.[1]?.trim();
@@ -3198,7 +3223,58 @@
       let answer = '';
       let sources = [];
 
-      if (/\b(consolidate|organize|roll up|combine)\b/.test(lower)) {
+      if (/\b(list|show)\b.*\blabels?\b/.test(lower) || /^labels?$/i.test(text)) {
+        const call = addChatToolCall('list_labels', {});
+        const items = allLabels();
+        answer = items.length
+          ? 'Labels:\n' + items.map(item => '- ' + item.name + ' (' + item.count + ')').join('\n')
+          : 'No labels yet.';
+        finishChatToolCall(call, { labels: items.map(item => item.name), items }, 'result');
+      } else if (/\b(create|add|new)\b.*\blabel\b/.test(lower)) {
+        const label = chatExtractLabel(text, opts) || /(?:label)\s+["“]?([^"”]+)["”]?$/i.exec(text)?.[1]?.trim();
+        if (!label) throw new Error('label_required');
+        const call = addChatToolCall('create_label', { name: label });
+        createLabelLocal(label);
+        const items = allLabels();
+        answer = 'Created label "' + label + '".';
+        finishChatToolCall(call, { labels: items.map(item => item.name), items }, 'result');
+      } else if (/\b(rename|update)\b.*\blabel\b/.test(lower)) {
+        const names = chatExtractLabelRename(text, opts);
+        if (!names.oldName || !names.newName) throw new Error('label_rename_args_required');
+        const call = addChatToolCall('update_label', { oldName: names.oldName, newName: names.newName, dryRun: !opts.confirm });
+        const affected = state.notes.filter(note => noteLabels(note).some(label => label.toLowerCase() === names.oldName.toLowerCase()));
+        if (opts.confirm) {
+          renameLabelLocal(names.oldName, names.newName);
+          const items = allLabels();
+          answer = 'Renamed label "' + names.oldName + '" to "' + names.newName + '".';
+          finishChatToolCall(call, { labels: items.map(item => item.name), items }, 'result');
+        } else {
+          queueChatApproval('update_label', call, names, {
+            oldName: names.oldName,
+            newName: names.newName,
+            affectedNoteIds: affected.map(note => note.id),
+          });
+          answer = 'Rename-label preview ready for "' + names.oldName + '".';
+        }
+      } else if (/\b(delete|remove)\b.*\blabel\b/.test(lower)) {
+        const label = chatExtractLabel(text, opts);
+        if (!label) throw new Error('label_required');
+        const call = addChatToolCall('delete_label', { name: label, dryRun: !opts.confirm });
+        const affected = state.notes.filter(note => noteLabels(note).some(item => item.toLowerCase() === label.toLowerCase()));
+        if (opts.confirm) {
+          deleteLabelLocal(label, true);
+          const items = allLabels();
+          answer = 'Deleted label "' + label + '".';
+          finishChatToolCall(call, { labels: items.map(item => item.name), items }, 'result');
+        } else {
+          queueChatApproval('delete_label', call, { name: label }, {
+            name: label,
+            affectedNoteIds: affected.map(note => note.id),
+            affected: affected.length,
+          });
+          answer = 'Delete-label preview ready for "' + label + '".';
+        }
+      } else if (/\b(consolidate|organize|roll up|combine)\b/.test(lower)) {
         const call = addChatToolCall('consolidate_notes', { query: search.query, dryRun: !opts.confirm });
         sources = search.notes.map(chatNoteRef);
         const title = opts.title || 'Consolidated Notes';
@@ -3297,6 +3373,26 @@
         sources = result.sources;
         answer = result.dryRun ? 'Label preview ready for ' + note.id + '.' : 'Added label "' + label + '" to "' + ((note.title && note.title.trim()) || 'Untitled Note') + '".';
         finishChatToolCall(call, result, 'result');
+      } else if (/\bmove\b/.test(lower) && note) {
+        const machine = chatExtractMachine(text, opts);
+        if (!machine) throw new Error('machine_required');
+        const machineName = opts.machineName || '';
+        const call = addChatToolCall('move_note', { id: note.id, machine, machineName, dryRun: !opts.confirm });
+        sources = [chatNoteRef(note)];
+        if (opts.confirm) {
+          const moved = moveNoteToMachine(note.id, machine, machineName);
+          answer = 'Moved "' + ((note.title && note.title.trim()) || 'Untitled Note') + '" to ' + machine + '.';
+          finishChatToolCall(call, { note: chatNoteRef(moved || note), sources: [chatNoteRef(moved || note)] }, 'result');
+        } else {
+          queueChatApproval('move_note', call, { id: note.id, machine, machineName }, {
+            id: note.id,
+            title: note.title,
+            fromMachine: note.machine || '',
+            toMachine: machine,
+            machineName,
+          });
+          answer = 'Move preview ready for ' + note.id + '.';
+        }
       } else if (/\barchive\b/.test(lower) && note) {
         const call = addChatToolCall('archive_note', { id: note.id, dryRun: !opts.confirm });
         sources = [chatNoteRef(note)];
@@ -3674,6 +3770,24 @@
     }
     const input = approval.input || {};
     const note = input.id ? noteById(input.id) : null;
+    if (approval.toolName === 'update_label') {
+      renameLabelLocal(input.oldName, input.newName);
+      const items = allLabels();
+      const result = { approved: true, labels: items.map(item => item.name), items, approval };
+      if (call) finishChatToolCall(call, result, 'result');
+      emitChat('hasna:chat-finish', result);
+      setChatStatus('ready');
+      return result;
+    }
+    if (approval.toolName === 'delete_label') {
+      deleteLabelLocal(input.name, true);
+      const items = allLabels();
+      const result = { approved: true, labels: items.map(item => item.name), items, approval };
+      if (call) finishChatToolCall(call, result, 'result');
+      emitChat('hasna:chat-finish', result);
+      setChatStatus('ready');
+      return result;
+    }
     if (note && approval.toolName === 'update_note') {
       if (input.title != null) note.title = String(input.title);
       if (input.body != null) note.body = String(input.body);
@@ -3688,6 +3802,8 @@
       render();
     } else if (note && approval.toolName === 'restore_note') {
       restoreNote(note.id);
+    } else if (note && approval.toolName === 'move_note') {
+      moveNoteToMachine(note.id, input.machine, input.machineName);
     }
     if (note) {
       const result = { approved: true, note: chatNoteRef(note), approval };
@@ -3803,6 +3919,7 @@
       create: createLabelLocal,
       rename: renameLabelLocal,
       delete: function (name, confirmed) { return deleteLabelLocal(name, !!confirmed); },
+      select: selectLabel,
     },
 	    view: {
 	      state: viewSnapshot,
