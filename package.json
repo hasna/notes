@@ -1,0 +1,52 @@
+{
+  "name": "@hasna/personalnotes",
+  "version": "0.1.0",
+  "description": "Local-first personal notes CLI and MCP server with optional hosted PersonalNotes.ai cloud mode.",
+  "type": "module",
+  "bin": {
+    "personalnotes": "bin/personalnotes.mjs",
+    "personalnotes-mcp": "bin/personalnotes-mcp.mjs",
+    "hasna-notes": "bin/hasna-notes.mjs",
+    "hasna-notes-mcp": "bin/hasna-notes-mcp.mjs"
+  },
+  "exports": {
+    ".": "./tools/notes-lib.mjs",
+    "./cloud": "./cloud/index.mjs"
+  },
+  "files": [
+    "bin",
+    "cli/hasna-notes.mjs",
+    "cloud/index.mjs",
+    "mcp/hasna-notes-mcp.mjs",
+    "tools/notes-agent.mjs",
+    "tools/notes-lib.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "pack:dry": "bun pm pack --dry-run"
+  },
+  "keywords": [
+    "personalnotes",
+    "notes",
+    "mcp",
+    "cli",
+    "local-first"
+  ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org",
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hasna/notes.git"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/bun": "1.2.4"
+  }
+}

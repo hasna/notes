@@ -1,9 +1,9 @@
-# Hasna Notes
+# PersonalNotes
 
 A simple, beautiful native macOS notes app built with **SwiftUI** and Apple's **2026
 Liquid Glass** design language (macOS 26). Notes are stored as plain Markdown files
-with YAML frontmatter, so they stay forward-compatible with the planned
-`@hasna/notes` catalog/CLI.
+with YAML frontmatter, so they stay forward-compatible with the installable
+`@hasna/personalnotes` CLI/MCP package.
 
 ![narrow purple sidebar · continuous white canvas · rich-text editor]
 
@@ -30,10 +30,12 @@ with YAML frontmatter, so they stay forward-compatible with the planned
 
 ## Data format — the contract
 
-The Markdown files are the **source of truth**. Hasna Notes reads and writes them so any
-other tool (the future `@hasna/notes` catalog/CLI) can index the same directory.
+The Markdown files are the **source of truth**. PersonalNotes reads and writes them so any
+other tool, including the `@hasna/personalnotes` CLI/MCP package, can index the same directory.
 
 - Data root: `~/.hasna/apps/notes/`
+- Preferred override: `PERSONALNOTES_ROOT`
+- Legacy override: `HASNA_NOTES_ROOT`
 - Notes: `~/.hasna/apps/notes/notes/<id>.md` (id is a lowercased UUID)
 - Writes are **atomic** (temp file in the same dir, then `rename`).
 - A missing/empty directory is created automatically.
@@ -157,6 +159,10 @@ node --test test/notes-functionality.test.mjs
 ### CLI / MCP
 
 ```bash
+personalnotes list --limit 10
+personalnotes-mcp
+
+# legacy aliases remain available
 node cli/hasna-notes.mjs list --limit 10
 node cli/hasna-notes.mjs labels assign <note-id> research
 node cli/hasna-notes.mjs move <note-id> apple04
@@ -170,6 +176,25 @@ node cli/hasna-notes.mjs agent "summarize notes" --json
 node cli/hasna-notes.mjs agent "consolidate notes" --json       # preview
 node cli/hasna-notes.mjs agent "consolidate notes" --yes --json # write
 node mcp/hasna-notes-mcp.mjs
+```
+
+Installable package:
+
+```bash
+bun install -g @hasna/personalnotes
+personalnotes --help
+personalnotes-mcp
+```
+
+Hosted PersonalNotes.ai mode is optional. Local mode never calls the hosted API
+unless explicitly configured.
+
+```bash
+personalnotes auth login --email you@example.com
+personalnotes auth verify --email you@example.com --code 123456
+personalnotes cloud status
+personalnotes cloud list --json
+PERSONALNOTES_MODE=hosted PERSONALNOTES_API_KEY=pn_... personalnotes-mcp
 ```
 
 The CLI and MCP both default lists to the latest 10 notes and return pagination

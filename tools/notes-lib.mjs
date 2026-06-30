@@ -9,7 +9,7 @@ import { promisify } from 'node:util';
 const execFileAsync = promisify(execFile);
 
 export function dataRoot() {
-  return process.env.HASNA_NOTES_ROOT || join(homedir(), '.hasna', 'apps', 'notes');
+  return process.env.PERSONALNOTES_ROOT || process.env.HASNA_NOTES_ROOT || join(homedir(), '.hasna', 'apps', 'notes');
 }
 
 export function notesDir(root = dataRoot()) {
