@@ -40,6 +40,7 @@ Usage:
   personalnotes auth verify --email you@example.com --code 123456 [--json]
   personalnotes auth device [--json]
   personalnotes auth device-token --device-code dc_... [--json]
+  personalnotes auth device-exchange --exchange-token dt_... [--json]
   personalnotes auth device-approve --user-code XXXX-XXXX [--json]
   personalnotes auth whoami [--json]
   personalnotes auth logout
@@ -85,13 +86,22 @@ async function handleHosted(cmd, args, opts) {
       }
       return print(result, opts, result.message || `Device login status: ${result.status}`);
     }
+    if (action === 'device-exchange') {
+      const result = await client.exchangeDeviceLogin(opts['exchange-token']);
+      if (result.apiKey) {
+        const existing = await loadCloudConfig();
+        await saveCloudConfig({ ...existing, apiUrl: client.config.apiUrl, apiKey: result.apiKey });
+        return print(result, opts, `Device login complete. Config saved to ${CONFIG_PATH}`);
+      }
+      return print(result, opts, result.message || 'Device exchange complete.');
+    }
     if (action === 'device-approve') {
       const result = await client.approveDeviceLogin(opts['user-code']);
       if (result.apiKey) {
         const existing = await loadCloudConfig();
         await saveCloudConfig({ ...existing, apiUrl: client.config.apiUrl, apiKey: result.apiKey });
       }
-      return print(result, opts, result.apiKey ? `Device approved. Config saved to ${CONFIG_PATH}` : 'Device approved.');
+      return print(result, opts, result.apiKey ? `Device approved. Config saved to ${CONFIG_PATH}` : 'Device approved. Return to the requesting device to finish login.');
     }
     if (action === 'whoami') return print(await client.whoami(), opts);
     if (action === 'logout') {

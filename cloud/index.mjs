@@ -107,6 +107,10 @@ export class PersonalNotesCloudClient {
     return this.request('POST', '/api/v1/auth/device/token', { body: { deviceCode } });
   }
 
+  exchangeDeviceLogin(exchangeToken) {
+    return this.request('POST', '/api/v1/auth/device/exchange', { body: { exchangeToken } });
+  }
+
   approveDeviceLogin(userCode) {
     return this.request('POST', '/api/v1/auth/device/approve', { body: { userCode } });
   }
