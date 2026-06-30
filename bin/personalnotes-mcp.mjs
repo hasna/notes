@@ -75,7 +75,7 @@ if (!hosted) {
     if (name === 'personalnotes_notes_list') return textResult(await client.listNotes(args));
     if (name === 'personalnotes_notes_get') return textResult(await client.getNote(args.id));
     if (name === 'personalnotes_notes_create') return textResult(await client.createNote(args));
-    if (name === 'personalnotes_sync') return textResult(await client.sync({ items: args.items || [] }, args.idempotencyKey));
+    if (name === 'personalnotes_sync') return textResult(await client.sync({ items: args.items || [] }, args.idempotencyKey || undefined));
     if (name === 'personalnotes_export') return textResult(await client.exportNotes());
     throw new Error('unknown_tool');
   }

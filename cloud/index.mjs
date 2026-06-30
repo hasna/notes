@@ -1,5 +1,6 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -138,7 +139,7 @@ export class PersonalNotesCloudClient {
     return this.request('DELETE', `/api/v1/notes/${encodeURIComponent(id)}`);
   }
 
-  sync(input, idempotencyKey = `sync-${Date.now()}`) {
+  sync(input, idempotencyKey = `sync-${Date.now()}-${randomUUID()}`) {
     return this.request('POST', '/api/v1/sync', {
       body: input,
       headers: { 'idempotency-key': idempotencyKey },
